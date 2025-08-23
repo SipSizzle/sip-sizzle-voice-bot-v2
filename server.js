@@ -25,7 +25,7 @@ const {
   TWILIO_AUTH_TOKEN,
   TWILIO_NUMBER,
   MESSAGING_SERVICE_SID, // optional, recommended for A2P
-  STAFF_TRANSFER_NUMBER,
+  STAFF_TRANSFER_NUMBER, // optional, not used unless you add transfer
   RESTAURANT_NAME = 'Sip & Sizzle',
   RESTAURANT_CITY = 'Fort Myers, FL',
   RESTAURANT_ADDRESS = '2236 First Street, Fort Myers FL 33901',
@@ -40,7 +40,7 @@ const {
 
   OPENAI_REALTIME_MODEL = 'gpt-4o-realtime-preview',
   OPENAI_REALTIME_VOICE = 'verse',
-  PORT = 3000
+  PORT = process.env.PORT || 3000
 } = process.env;
 
 const openai = new OpenAI({ apiKey: OPENAI_API_KEY });
@@ -49,6 +49,13 @@ const VoiceResponse = twilio.twiml.VoiceResponse;
 
 // Root check
 app.get('/', (req, res) => res.send('OK'));
+
+// --- Simple TwiML test route (sanity check) ---
+app.all('/voice-test', (req, res) => {
+  const twiml = new VoiceResponse();
+  twiml.say({ voice: 'alice' }, 'Sip and Sizzle test line. If you hear this, webhooks are good.');
+  res.type('text/xml').send(twiml.toString());
+});
 
 // --- SMS endpoint (optional: sends quick links on inbound SMS) ---
 app.post('/sms', async (req, res) => {
@@ -65,7 +72,7 @@ app.post('/sms', async (req, res) => {
   res.status(204).end();
 });
 
-// --- Menu ingest from PDFs (legacy build) ---
+// --- Menu ingest from PDFs (Node-safe via pdfjs legacy build) ---
 const MENU_SOURCES = [
   { key: 'Day', url: DAY_MENU_LINK },
   { key: 'Dinner', url: DINNER_MENU_LINK },
@@ -73,10 +80,12 @@ const MENU_SOURCES = [
 ].filter(s => !!s.url);
 
 let MENU_LINES = []; // unified list of {source, text}
+
 async function fetchPdfText(url) {
   try {
     const resp = await fetch(url);
     const buf = Buffer.from(await resp.arrayBuffer());
+    // legacy build works well on Node; no worker config needed
     const loadingTask = getDocument({ data: buf, useWorkerFetch: false, isEvalSupported: false });
     const pdf = await loadingTask.promise;
     let txt = '';
@@ -113,17 +122,16 @@ function searchMenuLines(query, limit=8) {
     let score = 0;
     if (hay.includes(q)) score += 3;
     for (const w of tokens) if (w && hay.includes(w)) score += 1;
-    if (/\$\s?\d/.test(r.text)) score += 1;
+    if (/\$\s?\d/.test(r.text)) score += 1; // price hint
     return { r, score };
   }).filter(x => x.score > 0);
   scored.sort((a,b)=> b.score - a.score);
   const seen = new Set();
   const results = [];
   for (const {r} of scored) {
-    const key = r.text;
-    if (seen.has(key)) continue;
+    if (seen.has(r.text)) continue;
     results.push(r);
-    seen.add(key);
+    seen.add(r.text);
     if (results.length >= limit) break;
   }
   return results;
@@ -138,11 +146,12 @@ function formatMenuAnswer(q, rows) {
 await ingestMenus();
 
 // --- Voice: streaming via <Connect><Stream> ---
-app.post('/voice', (req, res) => {
+app.all('/voice', (req, res) => {
+  console.log('VOICE webhook hit');
   const twiml = new VoiceResponse();
-  // Optional: twiml.play(`https://${req.headers.host}/public/greeting.mp3`);
   const connect = twiml.connect();
-  connect.stream({ url: `wss://${req.headers.host}/twilio-stream`, track: 'both' });
+  // IMPORTANT: use 'both_tracks' (two-way audio), not 'both'
+  connect.stream({ url: `wss://${req.headers.host}/twilio-stream`, track: 'both_tracks' });
   res.type('text/xml').send(twiml.toString());
 });
 
@@ -187,6 +196,7 @@ function pcm16ToMulawB64(bufPCM16) {
   return out.toString('base64');
 }
 
+// Start HTTP server and WS upgrade
 const server = app.listen(PORT, () => console.log(`Voice bot listening on :${PORT}`));
 const wss = new WebSocketServer({ noServer: true });
 server.on('upgrade', (req, socket, head) => {
@@ -282,7 +292,7 @@ After emitting a token, continue with a concise spoken answer. Always note that 
           if (callSid) { const to = await getFromNumber(callSid); await sendSMS(to, `Sip & Sizzle Beverage Menu: ${BEVERAGE_MENU_LINK}`); }
         }
 
-        // Existing tokens
+        // Existing tokens for reservations/toast
         if (textBuffer.includes('[[SEND:OPENTABLE]]')) {
           textBuffer = textBuffer.replace('[[SEND:OPENTABLE]]','');
           if (callSid) { const to = await getFromNumber(callSid); await sendSMS(to, `Reservations: ${OPEN_TABLE_LINK}`); }
@@ -293,6 +303,7 @@ After emitting a token, continue with a concise spoken answer. Always note that 
         }
       }
 
+      // Stream audio chunks from OpenAI -> Twilio
       if (msg.type === 'output_audio.delta' && msg.audio && streamSid) {
         const b64Mu = pcm16ToMulawB64(Buffer.from(msg.audio, 'base64'));
         twilioWS.send(JSON.stringify({ event: 'media', streamSid, media: { payload: b64Mu } }));
@@ -304,11 +315,13 @@ After emitting a token, continue with a concise spoken answer. Always note that 
   oaWS.on('close', () => { try { twilioWS.close(); } catch {} });
   oaWS.on('error', (err) => console.error('OpenAI WS error', err));
 
+  // Twilio -> OpenAI
   twilioWS.on('message', (raw) => {
     const m = JSON.parse(raw.toString());
     if (m.event === 'start') {
       streamSid = m.start.streamSid;
       callSid = m.start.callSid;
+      // Prime the model
       oaWS.send(JSON.stringify({ type: 'response.create', response: { instructions: '' } }));
     } else if (m.event === 'media' && m.media?.payload) {
       const pcm16 = mulawB64ToPCM16(m.media.payload);
