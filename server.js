@@ -131,7 +131,11 @@ app.post('/voice', (req, res) => {
     hints: 'reservation, book, open table, table, order, toast, pickup, hours, address, parking, menu, specials, gluten, vegan, transfer, happy hour'
   });
 
-  gather.say({ voice: 'alice' }, `Thank you for calling ${RESTAURANT_NAME}, located at 2236 First Street in the heart of downtown Fort Myers. We are open everyday at 10am for breakfast and lunch and from 4pm to 10pm for dinner. We also have Happy Hour from 3pm to 5pm with $5 appetizers and $10 any craft cocktail.  How can I help today? You can say things like book a table, place a pickup order, hours, or specials.`);
+  gather.say(
+  { voice: 'Polly.Joanna-Neural', language: 'en-US' },
+  greeting
+);
+, `Thank you for calling ${RESTAURANT_NAME}, located at 2236 First Street in the heart of downtown Fort Myers. We are open everyday at 10am for breakfast and lunch and from 4pm to 10pm for dinner. We also have Happy Hour from 3pm to 5pm with $5 appetizers and $10 any craft cocktail.  How can I help today? You can say things like book a table, place a pickup order, hours, or specials.`);
 
   // Fallback if no input
   twiml.say({ voice: 'alice' }, `Sorry, I didn't catch that.`);
