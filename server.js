@@ -40,7 +40,7 @@ const LISTEN_PORT = process.env.PORT || 3000;
 
 const openai = new OpenAI({ apiKey: OPENAI_API_KEY });
 const twilioClient = twilio(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN);
-const VoiceResponse = twilio.twiml.VoiceResponse;
+const { VoiceResponse } = twilio.twiml;
 
 // Root check
 app.get('/', (req, res) => res.send('OK'));
@@ -52,17 +52,20 @@ app.all('/voice-test', (req, res) => {
   res.type('text/xml').send(twiml.toString());
 });
 
-// --- Minimal TwiML streaming route (no extra attributes to prevent 12200) ---
+// --- Minimal TwiML streaming route using Twilio helper (prevents 12100 by escaping XML) ---
 app.all('/voice', (req, res) => {
   const host = PUBLIC_HOST || req.get('X-Forwarded-Host') || req.get('Host');
   const wssUrl = `wss://${host}/twilio-stream`;
-  const xml =
-    `<?xml version="1.0" encoding="UTF-8"?>` +
-    `<Response>` +
-      `<Say voice="alice">Thank you for calling ${RESTAURANT_NAME}. One moment while I connect you.</Say>` +
-      `<Connect><Stream url="${wssUrl}"/></Connect>` +
-    `</Response>`;
-  res.status(200).type('text/xml').send(xml);
+
+  // Replace & with 'and' in spoken content to avoid XML entity issues.
+  const safeName = (RESTAURANT_NAME || '').replace(/&/g, 'and');
+
+  const twiml = new VoiceResponse();
+  twiml.say({ voice: 'alice' }, `Thank you for calling ${safeName}. One moment while I connect you.`);
+  const connect = twiml.connect();
+  connect.stream({ url: wssUrl });
+
+  res.status(200).type('text/xml').send(twiml.toString());
 });
 
 // --- SMS quick links ---
@@ -241,10 +244,10 @@ wss.on('connection', async (twilioWS, req) => {
   const oaUrl = `wss://api.openai.com/v1/realtime?model=${encodeURIComponent(OPENAI_REALTIME_MODEL)}`;
   const oaWS = new WebSocket(oaUrl, { headers: oaHeaders });
 
-  const greeting = `Thank you for calling ${RESTAURANT_NAME}. We’re in ${RESTAURANT_ADDRESS}, ${RESTAURANT_CITY}. We open daily at 10 a.m. for breakfast and lunch, and 4 to 10 p.m. for dinner. Happy Hour is 3 to 5 p.m. Ask me about menu items, prices, wine pairings, reservations, to-go orders, or parking.`;
+  const greeting = `Thank you for calling ${safeForSpeech(RESTAURANT_NAME)}. We’re in ${RESTAURANT_ADDRESS}, ${RESTAURANT_CITY}. We open daily at 10 a.m. for breakfast and lunch, and 4 to 10 p.m. for dinner. Happy Hour is 3 to 5 p.m. Ask me about menu items, prices, wine pairings, reservations, to-go orders, or parking.`;
 
   const instructions =
-`You are the friendly host for ${RESTAURANT_NAME}. Speak casually and briefly. Never invent prices or availability.
+`You are the friendly host for ${safeForSpeech(RESTAURANT_NAME)}. Speak casually and briefly. Never invent prices or availability.
 
 To look up menu items or prices, emit one token line:
 [[MENU_SEARCH: <query>]]
@@ -254,6 +257,8 @@ If caller wants links, emit one of:
 For reservations or to-go: [[SEND:OPENTABLE]] [[SEND:TOAST]]
 
 After emitting a token, continue with a concise spoken answer. Always note that items and prices may change.`;
+
+  function safeForSpeech(s) { return String(s || '').replace(/&/g, 'and'); }
 
   // --- OpenAI WS ---
   oaWS.on('open', () => {
