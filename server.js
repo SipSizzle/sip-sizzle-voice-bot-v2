@@ -87,7 +87,7 @@ app.post('/sms', async (req, res) => {
   if (DAY_MENU_LINK) parts.push(`Day Menu: ${DAY_MENU_LINK}`);
   if (DINNER_MENU_LINK) parts.push(`Dinner Menu: ${DINNER_MENU_LINK}`);
   if (BEVERAGE_MENU_LINK) parts.push(`Beverage Menu: ${BEVERAGE_MENU_LINK}`);
-  try { await sendSMS(From, parts.join('  |  ')); } catch (e) { console.error('SMS auto-reply failed', e.message); }
+  try { if (From) await sendSMS(From, parts.join('  |  ')); } catch (e) { console.error('SMS auto-reply failed', e.message); }
   res.status(204).end();
 });
 
@@ -166,7 +166,7 @@ function formatMenuAnswer(q, rows) {
   return `Here’s what I found:\n${bullets.join('\n')}\n(Items and prices can change; I can confirm with the team.)`;
 }
 
-// Start ingest (non-blocking)
+// Start ingest (non-blocking). If PDFs are funky, this can ingest zero; voice still works.
 ingestMenus().catch(e => console.error('Menu ingest failed at boot:', e));
 
 // --- μ-law helpers (Twilio uses 8kHz) ---
@@ -325,7 +325,12 @@ After emitting a token, continue with a concise spoken answer. Always note that 
     try {
       const msg = JSON.parse(data.toString());
 
-      if (msg.type === 'output_text.delta' && msg.delta) {
+      // Helpful debug
+      if (msg.type === 'response.created') console.log('OA response.created');
+      if (msg.type === 'response.done') console.log('OA response.done');
+      if (msg.type === 'error') console.error('OA ERROR:', msg.error || msg);
+
+      if (msg.type === 'response.text.delta' && msg.delta) {
         textBuffer += msg.delta;
 
         // MENU SEARCH
@@ -364,9 +369,9 @@ After emitting a token, continue with a concise spoken answer. Always note that 
         }
       }
 
-      // Buffer OpenAI audio until Twilio streamSid is known and socket OPEN
-      if (msg.type === 'output_audio.delta' && msg.audio) {
-        pendingToTwilio.push(msg.audio); // base64 PCM16
+      // Correct audio event name & field
+      if (msg.type === 'response.audio.delta' && msg.delta) {
+        pendingToTwilio.push(msg.delta); // base64 PCM16 from OpenAI
         flushToTwilio();
       }
     } catch (e) { console.error('OpenAI msg parse error', e); }
