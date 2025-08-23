@@ -4,7 +4,7 @@ import bodyParser from 'body-parser';
 import OpenAI from 'openai';
 import twilio from 'twilio';
 import WebSocket, { WebSocketServer } from 'ws';
-import { getDocument } from 'pdfjs-dist/legacy/build/pdf.mjs'; // Node-safe PDF parsing
+import { getDocument } from 'pdfjs-dist/legacy/build/pdf.mjs';
 import path from 'path';
 import { fileURLToPath } from 'url';
 
@@ -21,7 +21,7 @@ const {
   TWILIO_ACCOUNT_SID,
   TWILIO_AUTH_TOKEN,
   TWILIO_NUMBER,
-  MESSAGING_SERVICE_SID, // optional
+  MESSAGING_SERVICE_SID,
   RESTAURANT_NAME = 'Sip & Sizzle',
   RESTAURANT_CITY = 'Fort Myers, FL',
   RESTAURANT_ADDRESS = '2236 First Street, Fort Myers FL 33901',
@@ -32,7 +32,8 @@ const {
   BEVERAGE_MENU_LINK = '',
   OPENAI_REALTIME_MODEL = 'gpt-4o-realtime-preview',
   OPENAI_REALTIME_VOICE = 'verse',
-  PUBLIC_HOST
+  PUBLIC_HOST,
+  DISABLE_MENU_INGEST = 'false',
 } = process.env;
 
 const LISTEN_PORT = process.env.PORT || 3000;
@@ -41,7 +42,7 @@ const openai = new OpenAI({ apiKey: OPENAI_API_KEY });
 const twilioClient = twilio(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN);
 const { VoiceResponse } = twilio.twiml;
 
-// Root check
+// Root
 app.get('/', (req, res) => res.send('OK'));
 app.get('/health', (req, res) => res.json({ ok: true }));
 
@@ -54,7 +55,7 @@ app.all('/voice-test', (req, res) => {
 
 function safeForSpeech(s) { return String(s || '').replace(/&/g, 'and'); }
 
-// --- Minimal TwiML streaming route ---
+// --- Twilio streaming TwiML ---
 app.all('/voice', (req, res) => {
   const host = PUBLIC_HOST || req.get('X-Forwarded-Host') || req.get('Host');
   const httpBase = `https://${host}`;
@@ -96,14 +97,14 @@ const MENU_SOURCES = [
   { key: 'Beverage', url: BEVERAGE_MENU_LINK },
 ].filter(s => !!s.url);
 
-let MENU_LINES = []; // unified list of {source, text}
+let MENU_LINES = [];
 
 async function fetchPdfText(url) {
   try {
     const resp = await fetch(url, { headers: { 'User-Agent': 'Mozilla/5.0' } });
     if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
     const ab = await resp.arrayBuffer();
-    const data = new Uint8Array(ab); // pdfjs requires Uint8Array
+    const data = new Uint8Array(ab);
     const loadingTask = getDocument({ data, useWorkerFetch: false, isEvalSupported: false, disableFontFace: true });
     const pdf = await loadingTask.promise;
     let txt = '';
@@ -123,6 +124,7 @@ function normalizeLines(txt) {
   return txt.split(/\r?\n/).map(l => l.replace(/\s+/g, ' ').trim()).filter(Boolean);
 }
 async function ingestMenus() {
+  if (DISABLE_MENU_INGEST === 'true') { console.log('Menu ingest disabled by env'); return; }
   try {
     MENU_LINES = [];
     for (const src of MENU_SOURCES) {
@@ -161,17 +163,41 @@ function searchMenuLines(query, limit=8) {
 function formatMenuAnswer(q, rows) {
   if (!rows.length) return `I didn’t find “${q}” on the current menus. I can text you links to the Day, Dinner, or Beverage menus if you’d like.`;
   const bullets = rows.slice(0,5).map(x => `• (${x.source}) ${x.text}`);
-  return `Here’s what I found:\n${bullets.join('\n')}\n(Items and prices can change; I can confirm with the team.)`;
+  return `Here’s what I found:\n${bullets.join('\n')}\n(Items and prices may change.)`;
 }
 
 ingestMenus().catch(e => console.error('Menu ingest failed at boot:', e));
+
+// --- Helpers: PCM16 (24k) -> μ-law (8k) ---
+function linearToUlaw(sample) {
+  let sign = (sample >> 8) & 0x80;
+  if (sign) sample = -sample;
+  const CLIP = 32635;
+  if (sample > CLIP) sample = CLIP;
+  let exponent = 7;
+  for (let expMask = 0x4000; (sample & expMask) === 0 && exponent > 0; exponent--, expMask >>= 1) {}
+  const mantissa = (sample >> (exponent + 3)) & 0x0f;
+  return (~(sign | (exponent << 4) | mantissa)) & 0xff;
+}
+// naive decimation 24k -> 8k (pick every 3rd sample). Good enough for voice.
+function pcm24kToUlaw8k(pcm16LEBuf) {
+  const inSamples = pcm16LEBuf.length / 2;
+  const outSamples = Math.floor(inSamples / 3);
+  const out = Buffer.alloc(outSamples);
+  for (let i=0;i<outSamples;i++) {
+    const si = i*3*2;
+    const s = pcm16LEBuf.readInt16LE(si);
+    out[i] = linearToUlaw(s);
+  }
+  return out;
+}
 
 // --- Start HTTP server + WS ---
 const server = app.listen(LISTEN_PORT, () => console.log(`Voice bot listening on :${LISTEN_PORT}`));
 const wss = new WebSocketServer({ server, path: '/twilio-stream' });
 wss.on('headers', (headers, req) => { console.log('WS upgrade headers sent for', req.url); });
 
-// Cache callSid -> from number (for SMS)
+// Cache callSid -> from
 const callFromCache = new Map();
 async function getFromNumber(callSid) {
   if (callFromCache.has(callSid)) return callFromCache.get(callSid);
@@ -188,7 +214,7 @@ async function sendSMS(to, body) {
   return twilioClient.messages.create({ to, from: TWILIO_NUMBER, body: finalBody });
 }
 
-// --- WS per call: Twilio ↔ OpenAI Realtime (μ-law passthrough + VAD) ---
+// --- Bridge Twilio ↔ OpenAI Realtime ---
 wss.on('connection', async (twilioWS, req) => {
   console.log('Twilio WS connected', req.url);
   let streamSid = null;
@@ -196,15 +222,14 @@ wss.on('connection', async (twilioWS, req) => {
   let textAccum = "";
   let sentDay = false, sentDinner = false, sentBev = false;
 
-  // Buffer and state
-  let bytesSinceCommit = 0; // μ-law bytes (1 byte per 8k sample)
-  const COMMIT_BYTES = 1600; // 200ms at 8kHz
+  let bytesSinceCommit = 0;
+  const COMMIT_BYTES = 1600; // 200ms at 8k
 
   const pendingToTwilio = [];
   let twilioReady = false;
   let oaReady = false;
   let greetingSent = false;
-  let activeResponse = false; // track OA response lifecycle
+  let activeResponse = false;
 
   const oaHeaders = { 'Authorization': `Bearer ${OPENAI_API_KEY}`, 'OpenAI-Beta': 'realtime=v1' };
   const oaUrl = `wss://api.openai.com/v1/realtime?model=${encodeURIComponent(OPENAI_REALTIME_MODEL)}`;
@@ -245,8 +270,9 @@ After emitting a token, continue with a concise spoken answer. Always note that 
       session: {
         modalities: ['audio','text'],
         voice: OPENAI_REALTIME_VOICE,
+        // Keep Twilio input as mulaw 8k, output as PCM16 24k (we will resample to mulaw 8k)
         input_audio_format: { type: 'mulaw', sample_rate_hz: 8000 },
-        output_audio_format: { type: 'mulaw', sample_rate_hz: 8000 },
+        output_audio_format: { type: 'pcm16', sample_rate_hz: 24000 },
         turn_detection: { type: 'server_vad', threshold: 0.5, prefix_padding_ms: 150, silence_duration_ms: 500 },
         instructions
       }
@@ -273,7 +299,6 @@ After emitting a token, continue with a concise spoken answer. Always note that 
           textAccum = textAccum.replace(m[0], '');
           const rows = searchMenuLines(q, 8);
           const spoken = formatMenuAnswer(q, rows);
-          // Queue a follow-up spoken answer if no response is active
           if (!activeResponse) {
             activeResponse = true;
             console.log('Sending menu answer (audio+text)…');
@@ -304,8 +329,12 @@ After emitting a token, continue with a concise spoken answer. Always note that 
         }
       }
 
+      // OA audio (PCM16 24k) -> μ-law 8k for Twilio
       if (msg.type === 'response.audio.delta' && msg.delta) {
-        pendingToTwilio.push(msg.delta);
+        const pcm = Buffer.from(msg.delta, 'base64'); // little-endian 16-bit PCM @ 24k
+        const mu = pcm24kToUlaw8k(pcm);
+        const b64mu = mu.toString('base64');
+        pendingToTwilio.push(b64mu);
         flushToTwilio();
       }
     } catch (e) { console.error('OpenAI msg parse error', e); }
@@ -322,26 +351,15 @@ After emitting a token, continue with a concise spoken answer. Always note that 
 
   function sendBeep() {
     if (!streamSid || twilioWS.readyState !== WebSocket.OPEN) return;
-    // μ-law 8k tone generation (inline to avoid resample)
-    const sampleRate = 8000, ms = 250, freq = 440;
+    // tiny clickless 200ms 440Hz beep in μ-law 8k
+    const sampleRate = 8000, ms = 200, freq = 440;
     const samples = Math.floor(sampleRate * (ms / 1000));
-    const amp = 10000;
+    const amp = 7000;
     const mu = Buffer.alloc(samples);
     for (let i = 0; i < samples; i++) {
       const t = i / sampleRate;
-      const v = Math.sin(2 * Math.PI * freq * t);
-      const s = Math.max(-1, Math.min(1, v)) * amp;
-      // linearToUlaw
-      let sign = (s >> 8) & 0x80;
-      let val = s;
-      if (sign) val = -val;
-      const CLIP = 32635;
-      if (val > CLIP) val = CLIP;
-      let exponent = 7;
-      for (let expMask = 0x4000; (val & expMask) === 0 && exponent > 0; exponent--, expMask >>= 1) {}
-      let mantissa = (val >> (exponent + 3)) & 0x0f;
-      const ulawByte = ~(sign | (exponent << 4) | mantissa);
-      mu[i] = ulawByte & 0xff;
+      const s = Math.sin(2 * Math.PI * freq * t) * amp;
+      mu[i] = linearToUlaw(s);
     }
     const b64Mu = mu.toString('base64');
     twilioWS.send(JSON.stringify({ event: 'media', streamSid, media: { payload: b64Mu } }));
@@ -351,7 +369,6 @@ After emitting a token, continue with a concise spoken answer. Always note that 
   twilioWS.on('message', (raw) => {
     try {
       const m = JSON.parse(raw.toString());
-      // console.log('TWILIO EVENT:', m.event);
       if (m.event === 'start') {
         console.log('Twilio start received');
         streamSid = m.start.streamSid;
@@ -367,7 +384,7 @@ After emitting a token, continue with a concise spoken answer. Always note that 
           bytesSinceCommit += Buffer.from(b64mu, 'base64').length;
           if (bytesSinceCommit >= COMMIT_BYTES) {
             oaWS.send(JSON.stringify({ type: 'input_audio_buffer.commit' }));
-            // Do NOT send response.create here — rely on server VAD to trigger
+            // rely on server_vad to trigger responses
             bytesSinceCommit = 0;
           }
         }
