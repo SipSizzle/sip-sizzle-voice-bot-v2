@@ -52,18 +52,30 @@ app.all('/voice-test', (req, res) => {
   res.type('text/xml').send(twiml.toString());
 });
 
-// --- Minimal TwiML streaming route using Twilio helper ---
 function safeForSpeech(s) { return String(s || '').replace(/&/g, 'and'); }
+
+// --- Minimal TwiML streaming route using Twilio helper + statusCallback (no events attr) ---
 app.all('/voice', (req, res) => {
   const host = PUBLIC_HOST || req.get('X-Forwarded-Host') || req.get('Host');
+  const httpBase = `https://${host}`;
   const wssUrl = `wss://${host}/twilio-stream`;
 
   const twiml = new VoiceResponse();
   twiml.say({ voice: 'alice' }, `Thank you for calling ${safeForSpeech(RESTAURANT_NAME)}. One moment while I connect you.`);
   const connect = twiml.connect();
-  connect.stream({ url: wssUrl });
+  connect.stream({ url: wssUrl, statusCallback: `${httpBase}/stream-status`, statusCallbackMethod: 'POST' });
 
   res.status(200).type('text/xml').send(twiml.toString());
+});
+
+// --- Status callback for Twilio Stream lifecycle ---
+app.post('/stream-status', (req, res) => {
+  try {
+    console.log('STREAM STATUS:', JSON.stringify(req.body));
+  } catch (e) {
+    console.log('STREAM STATUS (raw):', req.body);
+  }
+  res.status(200).type('text/xml').send('<?xml version="1.0" encoding="UTF-8"?><Response/>');
 });
 
 // --- SMS quick links ---
@@ -200,10 +212,24 @@ function pcm16ToMulawB64(bufPCM16) {
   return out.toString('base64');
 }
 
+// Generate a short 440Hz tone (beep) in PCM16 at 8kHz
+function tonePCM16(freq = 440, ms = 400, sampleRate = 8000) {
+  const samples = Math.floor(sampleRate * (ms / 1000));
+  const buf = Buffer.alloc(samples * 2);
+  const amp = 10000;
+  for (let i = 0; i < samples; i++) {
+    const t = i / sampleRate;
+    const v = Math.sin(2 * Math.PI * freq * t);
+    const s = Math.max(-1, Math.min(1, v)) * amp;
+    buf.writeInt16LE(s, i*2);
+  }
+  return buf;
+}
+
 // Start HTTP server
 const server = app.listen(LISTEN_PORT, () => console.log(`Voice bot listening on :${LISTEN_PORT}`));
 
-// WebSocket server mounted with path (lets ws handle the upgrade/handshake)
+// WebSocket server mounted with path
 const wss = new WebSocketServer({ server, path: '/twilio-stream' });
 wss.on('headers', (headers, req) => {
   console.log('WS upgrade headers sent for', req.url);
@@ -341,35 +367,50 @@ After emitting a token, continue with a concise spoken answer. Always note that 
     }
   }
 
+  function sendBeep() {
+    if (!streamSid || twilioWS.readyState !== WebSocket.OPEN) return;
+    const beep = tonePCM16(440, 350, 8000);
+    const b64Mu = pcm16ToMulawB64(beep);
+    twilioWS.send(JSON.stringify({ event: 'media', streamSid, media: { payload: b64Mu } }));
+  }
+
   // --- Twilio WS ---
   twilioWS.on('message', (raw) => {
-    const m = JSON.parse(raw.toString());
-    if (m.event === 'start') {
-      console.log('Twilio start received');
-      streamSid = m.start.streamSid;
-      callSid = m.start.callSid;
-      // Now that Twilio is ready, send the greeting
-      if (oaWS.readyState === WebSocket.OPEN) {
-        oaWS.send(JSON.stringify({ type: 'response.create', response: { instructions: greeting } }));
+    try {
+      const m = JSON.parse(raw.toString());
+      console.log('TWILIO EVENT:', m.event);
+      if (m.event === 'start') {
+        console.log('Twilio start received');
+        streamSid = m.start.streamSid;
+        callSid = m.start.callSid;
+        sendBeep(); // prove outbound audio path
+        // Now that Twilio is ready, send the greeting
+        if (oaWS.readyState === WebSocket.OPEN) {
+          oaWS.send(JSON.stringify({ type: 'response.create', response: { instructions: greeting } }));
+        }
+        flushToTwilio();
+      } else if (m.event === 'media' && m.media?.payload) {
+        // Caller audio -> OpenAI (buffer if OA WS not open yet)
+        const pcm16 = mulawB64ToPCM16(m.media.payload);
+        const b64pcm = Buffer.from(pcm16).toString('base64');
+        if (oaWS.readyState === WebSocket.OPEN) {
+          oaWS.send(JSON.stringify({ type: 'input_audio_buffer.append', audio: b64pcm }));
+          oaWS.send(JSON.stringify({ type: 'input_audio_buffer.commit' }));
+          oaWS.send(JSON.stringify({ type: 'response.create' }));
+        } else {
+          pendingToOpenAI.push(b64pcm);
+        }
+      } else if (m.event === 'stop') {
+        console.log('Twilio stop received');
+        try { oaWS.close(); } catch {}
+        try { twilioWS.close(); } catch {}
       }
-      flushToTwilio();
-    } else if (m.event === 'media' && m.media?.payload) {
-      // Caller audio -> OpenAI (buffer if OA WS not open yet)
-      const pcm16 = mulawB64ToPCM16(m.media.payload);
-      const b64pcm = Buffer.from(pcm16).toString('base64');
-      if (oaWS.readyState === WebSocket.OPEN) {
-        oaWS.send(JSON.stringify({ type: 'input_audio_buffer.append', audio: b64pcm }));
-        oaWS.send(JSON.stringify({ type: 'input_audio_buffer.commit' }));
-        oaWS.send(JSON.stringify({ type: 'response.create' }));
-      } else {
-        pendingToOpenAI.push(b64pcm);
-      }
-    } else if (m.event === 'stop') {
-      try { oaWS.close(); } catch {}
-      try { twilioWS.close(); } catch {}
+    } catch (e) {
+      console.error('Twilio msg parse error', e);
     }
   });
 
+  twilioWS.on('ping', () => { try { twilioWS.pong(); } catch {} });
   twilioWS.on('close', (code, reason) => { console.log('Twilio WS closed', code, reason?.toString()); try { oaWS.close(); } catch {} });
   twilioWS.on('error', (err) => console.error('Twilio WS error', err));
 });
