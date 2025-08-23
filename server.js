@@ -4,13 +4,11 @@ import bodyParser from 'body-parser';
 import OpenAI from 'openai';
 import twilio from 'twilio';
 import WebSocket, { WebSocketServer } from 'ws';
-import { getDocument, GlobalWorkerOptions } from 'pdfjs-dist';
+// Use the **legacy** build for Node.js
+import { getDocument } from 'pdfjs-dist/legacy/build/pdf.mjs';
 import path from 'path';
 import fs from 'fs';
 import { fileURLToPath } from 'url';
-
-// Node runtime doesn't need a separate worker file
-GlobalWorkerOptions.workerSrc = undefined;
 
 const app = express();
 app.use(bodyParser.urlencoded({ extended: false }));
@@ -67,7 +65,7 @@ app.post('/sms', async (req, res) => {
   res.status(204).end();
 });
 
-// --- Menu ingest from PDFs (using pdfjs-dist in Node) ---
+// --- Menu ingest from PDFs (legacy build) ---
 const MENU_SOURCES = [
   { key: 'Day', url: DAY_MENU_LINK },
   { key: 'Dinner', url: DINNER_MENU_LINK },
@@ -79,7 +77,7 @@ async function fetchPdfText(url) {
   try {
     const resp = await fetch(url);
     const buf = Buffer.from(await resp.arrayBuffer());
-    const loadingTask = getDocument({ data: buf });
+    const loadingTask = getDocument({ data: buf, useWorkerFetch: false, isEvalSupported: false });
     const pdf = await loadingTask.promise;
     let txt = '';
     for (let i = 1; i <= pdf.numPages; i++) {
