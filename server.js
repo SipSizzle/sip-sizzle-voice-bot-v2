@@ -3,10 +3,19 @@ import express from 'express';
 import bodyParser from 'body-parser';
 import OpenAI from 'openai';
 import twilio from 'twilio';
+import WebSocket, { WebSocketServer } from 'ws';
+import pdf from 'pdf-parse';
+import path from 'path';
+import fs from 'fs';
+import { fileURLToPath } from 'url';
 
 const app = express();
 app.use(bodyParser.urlencoded({ extended: false }));
 app.use(bodyParser.json());
+
+// Static (optional) for hosting any files
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+app.use('/public', express.static(path.join(__dirname, 'public')));
 
 // --- ENV ---
 const {
@@ -14,212 +23,299 @@ const {
   TWILIO_ACCOUNT_SID,
   TWILIO_AUTH_TOKEN,
   TWILIO_NUMBER,
+  MESSAGING_SERVICE_SID, // optional, recommended for A2P
   STAFF_TRANSFER_NUMBER,
-  RESTAURANT_NAME,
-  RESTAURANT_CITY,
-  RESTAURANT_ADDRESS,
-  RESTAURANT_PARKING,
-  OPEN_TABLE_LINK,
-  TOAST_ORDER_LINK,
-  HOURS_JSON = '{}',
-  SPECIALS_JSON = '[]',
+  RESTAURANT_NAME = 'Sip & Sizzle',
+  RESTAURANT_CITY = 'Fort Myers, FL',
+  RESTAURANT_ADDRESS = '2236 First Street, Fort Myers FL 33901',
+  RESTAURANT_PARKING = 'Street parking is free after 5pm across downtown; two parking garages are within a block with plenty of parking.',
+  OPEN_TABLE_LINK = 'https://www.opentable.com/r/sip-and-sizzle-reservations-fort-myers?restref=1406116&lang=en-US&ot_source=Lucy',
+  TOAST_ORDER_LINK = 'https://order.toasttab.com/online/sip-sizzle-2236-first-street',
+
+  // PDFs for menus (user-provided)
+  DAY_MENU_LINK = '',
+  DINNER_MENU_LINK = '',
+  BEVERAGE_MENU_LINK = '',
+
+  OPENAI_REALTIME_MODEL = 'gpt-4o-realtime-preview',
+  OPENAI_REALTIME_VOICE = 'verse',
   PORT = 3000
 } = process.env;
 
-const OpenTable = OPEN_TABLE_LINK;
-const ToastLink = TOAST_ORDER_LINK;
-const hours = JSON.parse(HOURS_JSON || '{}');
-const specials = JSON.parse(SPECIALS_JSON || '[]');
-
-const VoiceResponse = twilio.twiml.VoiceResponse;
-const client = twilio(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN);
 const openai = new OpenAI({ apiKey: OPENAI_API_KEY });
+const twilioClient = twilio(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN);
+const VoiceResponse = twilio.twiml.VoiceResponse;
 
-// Simple in-memory sessions keyed by CallSid
-const SESSIONS = new Map();
-const getSession = (sid) => {
-  if (!SESSIONS.has(sid)) SESSIONS.set(sid, { history: [] });
-  return SESSIONS.get(sid);
-};
+// Root check
+app.get('/', (req, res) => res.send('OK'));
 
-// --- SYSTEM PROMPT ---
-const systemPrompt = () => `You are the friendly automated host for ${RESTAURANT_NAME} in ${RESTAURANT_CITY}.
-Facts you can rely on:
-- Address: ${RESTAURANT_ADDRESS}
-- Parking: ${RESTAURANT_PARKING}
-- Hours by day (lowercase keys): ${JSON.stringify(hours)}
-- Specials: ${JSON.stringify(specials)}
-- Reservations: Guests book via OpenTable link.
-- Pickup orders: Guests order via Toast online ordering link.
-
-Style: Warm, concise, professional. Never invent prices or availability.
-If unsure, say you'll text the official link.
-
-Allergens: provide general info only; advise guests to confirm with staff.
-
-Return a JSON object ONLY, with these fields:
-{
-  "reply_tts": string,
-  "send_sms": null | {
-    "type": "opentable" | "toast" | "generic",
-    "body": string,
-    "link": string | null
-  },
-  "transfer": boolean,
-  "end_call": boolean
-}
-
-Capabilities:
-- If caller asks to book: offer to text the OpenTable link and keep talking while they open it.
-- If caller asks to order pickup: offer to text the Toast link.
-- If caller asks hours, address, parking, specials: answer from facts above.
-- If caller asks for a person or special request you cannot complete: offer transfer to staff.
-`;
-
-// --- Helpers ---
-async function askLLM(callSid, userText) {
-  const session = getSession(callSid);
-  const messages = [
-    { role: 'system', content: systemPrompt() },
-    ...session.history,
-    { role: 'user', content: userText }
-  ];
-
-  const completion = await openai.chat.completions.create({
-    model: 'gpt-4o-mini',
-    temperature: 0.3,
-    response_format: { type: 'json_object' },
-    messages
-  });
-
-  const content = completion.choices[0].message.content || '{}';
-  let data;
-  try { data = JSON.parse(content); } catch (e) { data = { reply_tts: "Sorry, I had trouble. Let me transfer you to the team.", send_sms: null, transfer: true, end_call: false }; }
-
-  // Save assistant reply into history
-  session.history.push({ role: 'user', content: userText });
-  session.history.push({ role: 'assistant', content: data.reply_tts });
-  return data;
-}
-
-async function maybeSendSMS(to, payload) {
-  if (!payload) return;
-  let link = payload.link;
-  if (!link) {
-    if (payload.type === 'opentable') link = OpenTable;
-    if (payload.type === 'toast') link = ToastLink;
+// --- SMS endpoint (optional: sends quick links on inbound SMS) ---
+app.post('/sms', async (req, res) => {
+  const { From, Body } = req.body || {};
+  const lower = (Body || '').toLowerCase();
+  let msg = `Thanks for contacting ${RESTAURANT_NAME}! Reservations: ${OPEN_TABLE_LINK}  |  Pickup: ${TOAST_ORDER_LINK}`;
+  if (DAY_MENU_LINK || DINNER_MENU_LINK || BEVERAGE_MENU_LINK) {
+    msg += `  |  Menus:`;
+    if (DAY_MENU_LINK) msg += ` Day ${DAY_MENU_LINK}`;
+    if (DINNER_MENU_LINK) msg += ` Dinner ${DINNER_MENU_LINK}`;
+    if (BEVERAGE_MENU_LINK) msg += ` Beverage ${BEVERAGE_MENU_LINK}`;
   }
-  const body = link ? `${payload.body}\n${link}` : payload.body;
-  if (!body) return;
+  try { await sendSMS(From, msg); } catch (e) { console.error('SMS auto-reply failed', e.message); }
+  res.status(204).end();
+});
+
+// --- Menu ingest from PDFs ---
+const MENU_SOURCES = [
+  { key: 'Day', url: DAY_MENU_LINK },
+  { key: 'Dinner', url: DINNER_MENU_LINK },
+  { key: 'Beverage', url: BEVERAGE_MENU_LINK },
+].filter(s => !!s.url);
+
+let MENU_LINES = []; // unified list of {source, text}
+async function fetchPdfText(url) {
   try {
-    await client.messages.create({ to, from: TWILIO_NUMBER, body });
-  } catch (err) {
-    console.error('SMS send failed:', err.message);
+    const resp = await fetch(url);
+    const buf = Buffer.from(await resp.arrayBuffer());
+    const data = await pdf(buf);
+    return data.text || '';
+  } catch (e) {
+    console.error('Failed to fetch/parse PDF', url, e.message);
+    return '';
   }
 }
+function normalizeLines(txt) {
+  return txt.split(/\r?\n/).map(l => l.replace(/\s+/g, ' ').trim()).filter(Boolean);
+}
+async function ingestMenus() {
+  MENU_LINES = [];
+  for (const src of MENU_SOURCES) {
+    const t = await fetchPdfText(src.url);
+    const lines = normalizeLines(t);
+    MENU_LINES.push(...lines.map(l => ({ source: src.key, text: l })));
+  }
+  console.log(`Ingested ${MENU_LINES.length} menu lines from ${MENU_SOURCES.length} PDFs`);
+}
+function searchMenuLines(query, limit=8) {
+  if (!MENU_LINES.length) return [];
+  const q = (query||'').toLowerCase();
+  const tokens = q.split(/\s+/).filter(Boolean);
+  const scored = MENU_LINES.map(r => {
+    const hay = r.text.toLowerCase();
+    let score = 0;
+    if (hay.includes(q)) score += 3;
+    for (const w of tokens) if (w && hay.includes(w)) score += 1;
+    // price boost
+    if (/\$\s?\d/.test(r.text)) score += 1;
+    return { r, score };
+  }).filter(x => x.score > 0);
+  scored.sort((a,b)=> b.score - a.score);
+  const seen = new Set();
+  const results = [];
+  for (const {r} of scored) {
+    const key = r.text;
+    if (seen.has(key)) continue;
+    results.push(r);
+    seen.add(key);
+    if (results.length >= limit) break;
+  }
+  return results;
+}
+function formatMenuAnswer(q, rows) {
+  if (!rows.length) return `I didn’t find “${q}” on the current menus. I can text you links to the Day, Dinner, or Beverage menus if you’d like.`;
+  const bullets = rows.slice(0,5).map(x => `• (${x.source}) ${x.text}`);
+  return `Here’s what I found:\n${bullets.join('\n')}\n(Items and prices can change; I can confirm with the team.)`;
+}
 
-// --- Voice entrypoint ---
+// refresh menus at startup
+await ingestMenus();
+
+// --- Voice: switch to streaming via <Connect><Stream> ---
 app.post('/voice', (req, res) => {
   const twiml = new VoiceResponse();
-  const gather = twiml.gather({
-    input: 'speech dtmf',
-    numDigits: 1,
-    action: '/gather',
-    method: 'POST',
-    language: 'en-US',
-    speechTimeout: 'auto',
-    hints: 'reservation, book, open table, table, order, toast, pickup, hours, address, parking, menu, specials, gluten, vegan, transfer, happy hour'
-  });
+  // Optional: play recorded greeting here
+  // twiml.play(`https://${req.headers.host}/public/greeting.mp3`);
 
-  gather.say(
-  { voice: 'Polly.Joanna-Neural', language: 'en-US' },
-  greeting
-);
-, `Thank you for calling ${RESTAURANT_NAME}, located at 2236 First Street in the heart of downtown Fort Myers. We are open everyday at 10am for breakfast and lunch and from 4pm to 10pm for dinner. We also have Happy Hour from 3pm to 5pm with $5 appetizers and $10 any craft cocktail.  How can I help today? You can say things like book a table, place a pickup order, hours, or specials.`);
-
-  // Fallback if no input
-  twiml.say({ voice: 'alice' }, `Sorry, I didn't catch that.`);
-  twiml.redirect('/voice');
+  const connect = twiml.connect();
+  connect.stream({ url: `wss://${req.headers.host}/twilio-stream`, track: 'both' });
 
   res.type('text/xml').send(twiml.toString());
 });
 
-// --- Gather handler ---
-app.post('/gather', async (req, res) => {
-  const { CallSid, From, To, SpeechResult, Digits } = req.body;
-  const twiml = new VoiceResponse();
-
-  try {
-    let userText = (SpeechResult || '').trim();
-
-    // DTMF shortcuts
-    if (!userText && Digits) {
-      if (Digits === '1') userText = "What are today's hours?";
-      if (Digits === '2') userText = "What's the address and parking?";
-      if (Digits === '3') userText = 'Please send me the OpenTable link to book.';
-      if (Digits === '4') userText = 'Please send me the Toast ordering link.';
-      if (Digits === '0') userText = 'I want to talk to a person.';
-    }
-
-    if (!userText) {
-      twiml.say({ voice: 'alice' }, `Sorry, I didn't hear anything.`);
-      twiml.redirect('/voice');
-      return res.type('text/xml').send(twiml.toString());
-    }
-
-    const data = await askLLM(CallSid, userText);
-
-    // Send SMS if requested
-    await maybeSendSMS(From, data.send_sms);
-
-    // Transfer if requested
-    if (data.transfer && STAFF_TRANSFER_NUMBER) {
-      twiml.say({ voice: 'alice' }, 'Sure—one moment while I transfer you.');
-      const dial = twiml.dial({ callerId: From });
-      dial.number(STAFF_TRANSFER_NUMBER);
-      return res.type('text/xml').send(twiml.toString());
-    }
-
-    // Speak reply
-    twiml.say({ voice: 'alice' }, data.reply_tts || 'Okay.');
-
-    if (data.end_call) {
-      twiml.say({ voice: 'alice' }, 'Thanks for calling and have a great day!');
-      twiml.hangup();
-    } else {
-      const gather = twiml.gather({
-        input: 'speech dtmf',
-        numDigits: 1,
-        action: '/gather',
-        method: 'POST',
-        language: 'en-US',
-        speechTimeout: 'auto'
-      });
-      gather.say({ voice: 'alice' }, 'Anything else I can help with?');
-    }
-
-    res.type('text/xml').send(twiml.toString());
-  } catch (err) {
-    console.error('Gather error:', err);
-    twiml.say({ voice: 'alice' }, 'Sorry, I ran into a problem. Let me transfer you to the team.');
-    if (STAFF_TRANSFER_NUMBER) {
-      const dial = twiml.dial({ callerId: From });
-      dial.number(STAFF_TRANSFER_NUMBER);
-    } else {
-      twiml.say({ voice: 'alice' }, 'Please call back in a few minutes.');
-      twiml.hangup();
-    }
-    res.type('text/xml').send(twiml.toString());
+// --- μ-law helpers (Twilio uses 8kHz) ---
+const BIAS = 0x84, CLIP = 32635;
+const exp_lut = [0,132,396,924,1980,4092,8316,16764];
+function ulawToLinear(ulawByte) {
+  ulawByte = ~ulawByte & 0xff;
+  const sign = (ulawByte & 0x80);
+  const exponent = (ulawByte >> 4) & 0x07;
+  const mantissa = ulawByte & 0x0f;
+  let sample = exp_lut[exponent] + (mantissa << (exponent + 3));
+  if (sign) sample = -sample;
+  return sample;
+}
+function linearToUlaw(sample) {
+  let sign = (sample >> 8) & 0x80;
+  if (sign) sample = -sample;
+  if (sample > CLIP) sample = CLIP;
+  let exponent = 7;
+  for (let expMask = 0x4000; (sample & expMask) === 0 && exponent > 0; exponent--, expMask >>= 1) {}
+  let mantissa = (sample >> (exponent + 3)) & 0x0f;
+  const ulawByte = ~(sign | (exponent << 4) | mantissa);
+  return ulawByte & 0xff;
+}
+function mulawB64ToPCM16(b64) {
+  const mu = Buffer.from(b64, 'base64');
+  const out = Buffer.alloc(mu.length * 2);
+  for (let i = 0; i < mu.length; i++) {
+    const s = ulawToLinear(mu[i]);
+    out.writeInt16LE(s, i*2);
   }
+  return out; // 8kHz PCM16 LE
+}
+function pcm16ToMulawB64(bufPCM16) {
+  const frames = bufPCM16.length / 2;
+  const out = Buffer.alloc(frames);
+  for (let i = 0; i < frames; i++) {
+    const s = bufPCM16.readInt16LE(i*2);
+    out[i] = linearToUlaw(s);
+  }
+  return out.toString('base64');
+}
+
+const server = app.listen(PORT, () => console.log(`Voice bot listening on :${PORT}`));
+const wss = new WebSocketServer({ noServer: true });
+server.on('upgrade', (req, socket, head) => {
+  if (!req.url.startsWith('/twilio-stream')) { socket.destroy(); return; }
+  wss.handleUpgrade(req, socket, head, (ws) => wss.emit('connection', ws, req));
 });
 
-// Optional inbound SMS handler
-app.post('/sms', async (req, res) => {
-  const { From, Body } = req.body;
-  const msg = `Thanks for texting ${RESTAURANT_NAME}! For reservations use OpenTable: ${OpenTable}\nFor pickup orders use Toast: ${ToastLink}`;
-  try { await client.messages.create({ to: From, from: TWILIO_NUMBER, body: msg }); } catch (e) { console.error('SMS autoreply failed:', e.message); }
-  res.status(204).end();
-});
+// Cache callSid -> from number (for SMS)
+const callFromCache = new Map();
+async function getFromNumber(callSid) {
+  if (callFromCache.has(callSid)) return callFromCache.get(callSid);
+  const call = await twilioClient.calls(callSid).fetch();
+  callFromCache.set(callSid, call.from);
+  return call.from;
+}
 
-app.get('/', (req, res) => res.send('OK'));
-app.listen(PORT, () => console.log(`Voice bot listening on :${PORT}`));
+async function sendSMS(to, body) {
+  const suffix = " Reply STOP to opt out. HELP for help. Msg&data rates may apply.";
+  const finalBody = body.endsWith(suffix) ? body : (body + suffix);
+  if (process.env.MESSAGING_SERVICE_SID) {
+    return twilioClient.messages.create({ to, body: finalBody, messagingServiceSid: process.env.MESSAGING_SERVICE_SID });
+  }
+  return twilioClient.messages.create({ to, from: TWILIO_NUMBER, body: finalBody });
+}
+
+// --- WS per call: bridge Twilio ↔ OpenAI Realtime ---
+wss.on('connection', async (twilioWS, req) => {
+  let streamSid = null;
+  let callSid = null;
+  let textBuffer = "";
+  let sentDay = false, sentDinner = false, sentBev = false;
+
+  const oaHeaders = { 'Authorization': `Bearer ${OPENAI_API_KEY}`, 'OpenAI-Beta': 'realtime=v1' };
+  const oaUrl = `wss://api.openai.com/v1/realtime?model=${encodeURIComponent(OPENAI_REALTIME_MODEL)}`;
+  const oaWS = new WebSocket(oaUrl, { headers: oaHeaders });
+
+  oaWS.on('open', () => {
+    const greeting = `Thank you for calling ${RESTAURANT_NAME}, located at ${RESTAURANT_ADDRESS} in ${RESTAURANT_CITY}. We are open every day at 10 a.m. for breakfast and lunch, and from 4 p.m. to 10 p.m. for dinner. Happy Hour is 3 to 5 p.m. with five-dollar appetizers and ten-dollar craft cocktails. You can ask me about menu items, prices, wine pairings, reservations, to-go orders, hours, or parking.`;
+
+    const instructions =
+`You are the friendly host for ${RESTAURANT_NAME}. Speak naturally and briefly. Never invent prices or availability.
+
+To look up menu items or prices, emit one token line:
+[[MENU_SEARCH: <query>]]
+Examples: [[MENU_SEARCH: salmon]]  [[MENU_SEARCH: old fashioned]]  [[MENU_SEARCH: ribeye]]
+
+If caller wants links, emit one of:
+[[SEND:MENU_DAY]] [[SEND:MENU_DINNER]] [[SEND:MENU_BEVERAGE]]
+For reservations or to-go: [[SEND:OPENTABLE]] [[SEND:TOAST]]
+
+After emitting a token, continue with a concise spoken answer. Always note that items and prices may change.`;
+
+    oaWS.send(JSON.stringify({
+      type: 'session.update',
+      session: {
+        voice: OPENAI_REALTIME_VOICE,
+        input_audio_format: { type: 'pcm16', sample_rate_hz: 8000 },
+        output_audio_format: { type: 'pcm16', sample_rate_hz: 8000 },
+        instructions
+      }
+    }));
+    oaWS.send(JSON.stringify({ type: 'response.create', response: { instructions: greeting } }));
+  });
+
+  oaWS.on('message', async (data) => {
+    try {
+      const msg = JSON.parse(data.toString());
+
+      if (msg.type === 'output_text.delta' && msg.delta) {
+        textBuffer += msg.delta;
+
+        // MENU SEARCH
+        const m = textBuffer.match(/\[\[MENU_SEARCH:\s*([^\]]+)\]\]/i);
+        if (m) {
+          const q = m[1].trim();
+          textBuffer = textBuffer.replace(m[0], '');
+          const rows = searchMenuLines(q, 8);
+          const spoken = formatMenuAnswer(q, rows);
+          oaWS.send(JSON.stringify({ type: 'response.create', response: { instructions: spoken } }));
+        }
+
+        // SEND LINKS
+        if (!sentDay && DAY_MENU_LINK && textBuffer.includes('[[SEND:MENU_DAY]]')) {
+          sentDay = true; textBuffer = textBuffer.replace('[[SEND:MENU_DAY]]','');
+          if (callSid) { const to = await getFromNumber(callSid); await sendSMS(to, `Sip & Sizzle Day Menu: ${DAY_MENU_LINK}`); }
+        }
+        if (!sentDinner && DINNER_MENU_LINK && textBuffer.includes('[[SEND:MENU_DINNER]]')) {
+          sentDinner = true; textBuffer = textBuffer.replace('[[SEND:MENU_DINNER]]','');
+          if (callSid) { const to = await getFromNumber(callSid); await sendSMS(to, `Sip & Sizzle Dinner Menu: ${DINNER_MENU_LINK}`); }
+        }
+        if (!sentBev && BEVERAGE_MENU_LINK && textBuffer.includes('[[SEND:MENU_BEVERAGE]]')) {
+          sentBev = true; textBuffer = textBuffer.replace('[[SEND:MENU_BEVERAGE]]','');
+          if (callSid) { const to = await getFromNumber(callSid); await sendSMS(to, `Sip & Sizzle Beverage Menu: ${BEVERAGE_MENU_LINK}`); }
+        }
+
+        // Also support existing tokens for reservations/toast
+        if (textBuffer.includes('[[SEND:OPENTABLE]]')) {
+          textBuffer = textBuffer.replace('[[SEND:OPENTABLE]]','');
+          if (callSid) { const to = await getFromNumber(callSid); await sendSMS(to, `Reservations: ${OPEN_TABLE_LINK}`); }
+        }
+        if (textBuffer.includes('[[SEND:TOAST]]')) {
+          textBuffer = textBuffer.replace('[[SEND:TOAST]]','');
+          if (callSid) { const to = await getFromNumber(callSid); await sendSMS(to, `Pickup ordering: ${TOAST_ORDER_LINK}`); }
+        }
+      }
+
+      if (msg.type === 'output_audio.delta' && msg.audio && streamSid) {
+        const b64Mu = pcm16ToMulawB64(Buffer.from(msg.audio, 'base64'));
+        twilioWS.send(JSON.stringify({ event: 'media', streamSid, media: { payload: b64Mu } }));
+      }
+
+    } catch (e) { console.error('OpenAI msg parse error', e); }
+  });
+
+  oaWS.on('close', () => { try { twilioWS.close(); } catch {} });
+  oaWS.on('error', (err) => console.error('OpenAI WS error', err));
+
+  twilioWS.on('message', (raw) => {
+    const m = JSON.parse(raw.toString());
+    if (m.event === 'start') {
+      streamSid = m.start.streamSid;
+      callSid = m.start.callSid;
+      oaWS.send(JSON.stringify({ type: 'response.create', response: { instructions: '' } }));
+    } else if (m.event === 'media' && m.media?.payload) {
+      const pcm16 = mulawB64ToPCM16(m.media.payload);
+      oaWS.send(JSON.stringify({ type: 'input_audio_buffer.append', audio: pcm16.toString('base64') }));
+      oaWS.send(JSON.stringify({ type: 'input_audio_buffer.commit' }));
+      oaWS.send(JSON.stringify({ type: 'response.create' }));
+    } else if (m.event === 'stop') {
+      try { oaWS.close(); } catch {}
+      try { twilioWS.close(); } catch {}
+    }
+  });
+
+  twilioWS.on('close', () => { try { oaWS.close(); } catch {} });
+  twilioWS.on('error', (err) => console.error('Twilio WS error', err));
+});

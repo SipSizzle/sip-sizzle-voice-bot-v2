@@ -1,6 +1,6 @@
 {
   "name": "sip-sizzle-voice-bot",
-  "version": "1.0.0",
+  "version": "3.0.0",
   "type": "module",
   "scripts": {
     "start": "node server.js",
@@ -11,7 +11,9 @@
     "express": "^4.19.2",
     "openai": "^4.56.0",
     "twilio": "^5.3.6",
-    "body-parser": "^1.20.2"
+    "body-parser": "^1.20.2",
+    "ws": "^8.18.0",
+    "pdf-parse": "^1.1.1"
   },
   "devDependencies": {
     "nodemon": "^3.0.2"
