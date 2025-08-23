@@ -6,7 +6,6 @@ import twilio from 'twilio';
 import WebSocket, { WebSocketServer } from 'ws';
 import { getDocument } from 'pdfjs-dist/legacy/build/pdf.mjs'; // Node-safe PDF parsing
 import path from 'path';
-import fs from 'fs';
 import { fileURLToPath } from 'url';
 
 const app = express();
@@ -53,19 +52,17 @@ app.all('/voice-test', (req, res) => {
   res.type('text/xml').send(twiml.toString());
 });
 
-// --- Minimal TwiML streaming route with statusCallback ---
+// --- Minimal TwiML streaming route (no extra attributes to prevent 12200) ---
 app.all('/voice', (req, res) => {
   const host = PUBLIC_HOST || req.get('X-Forwarded-Host') || req.get('Host');
-  const httpBase = `https://${host}`;
   const wssUrl = `wss://${host}/twilio-stream`;
-  const xml = `<?xml version="1.0" encoding="UTF-8"?><Response><Connect><Stream url="${wssUrl}" statusCallback="${httpBase}/stream-status" statusCallbackMethod="POST" statusCallbackEvents="start media stop error"/></Connect></Response>`;
+  const xml =
+    `<?xml version="1.0" encoding="UTF-8"?>` +
+    `<Response>` +
+      `<Say voice="alice">Thank you for calling ${RESTAURANT_NAME}. One moment while I connect you.</Say>` +
+      `<Connect><Stream url="${wssUrl}"/></Connect>` +
+    `</Response>`;
   res.status(200).type('text/xml').send(xml);
-});
-
-// --- Status callback to monitor Twilio stream lifecycle ---
-app.post('/stream-status', (req, res) => {
-  console.log('STREAM STATUS:', JSON.stringify(req.body));
-  res.status(200).type('text/xml').send('<?xml version="1.0" encoding="UTF-8"?><Response/>');
 });
 
 // --- SMS quick links ---
@@ -83,7 +80,7 @@ app.post('/sms', async (req, res) => {
   res.status(204).end();
 });
 
-// --- Menu ingest from PDFs (pdfjs requires Uint8Array data) ---
+// --- Menu ingest from PDFs (Uint8Array for pdfjs) ---
 const MENU_SOURCES = [
   { key: 'Day', url: DAY_MENU_LINK },
   { key: 'Dinner', url: DINNER_MENU_LINK },
@@ -95,8 +92,9 @@ let MENU_LINES = []; // unified list of {source, text}
 async function fetchPdfText(url) {
   try {
     const resp = await fetch(url, { headers: { 'User-Agent': 'Mozilla/5.0' } });
+    if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
     const ab = await resp.arrayBuffer();
-    const data = new Uint8Array(ab); // <-- FIX: pdfjs requires Uint8Array
+    const data = new Uint8Array(ab); // pdfjs requires Uint8Array
     const loadingTask = getDocument({ data, useWorkerFetch: false, isEvalSupported: false, disableFontFace: true });
     const pdf = await loadingTask.promise;
     let txt = '';
@@ -157,11 +155,10 @@ function formatMenuAnswer(q, rows) {
   return `Here’s what I found:\n${bullets.join('\n')}\n(Items and prices can change; I can confirm with the team.)`;
 }
 
-// Kick off ingest without blocking Twilio response
+// Start ingest (non-blocking)
 ingestMenus().catch(e => console.error('Menu ingest failed at boot:', e));
 
 // --- μ-law helpers (Twilio uses 8kHz) ---
-const BIAS = 0x84, CLIP = 32635;
 const exp_lut = [0,132,396,924,1980,4092,8316,16764];
 function ulawToLinear(ulawByte) {
   ulawByte = ~ulawByte & 0xff;
@@ -175,6 +172,7 @@ function ulawToLinear(ulawByte) {
 function linearToUlaw(sample) {
   let sign = (sample >> 8) & 0x80;
   if (sign) sample = -sample;
+  const CLIP = 32635;
   if (sample > CLIP) sample = CLIP;
   let exponent = 7;
   for (let expMask = 0x4000; (sample & expMask) === 0 && exponent > 0; exponent--, expMask >>= 1) {}
