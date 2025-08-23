@@ -4,8 +4,7 @@ import bodyParser from 'body-parser';
 import OpenAI from 'openai';
 import twilio from 'twilio';
 import WebSocket, { WebSocketServer } from 'ws';
-// Node-safe PDF parsing (legacy build)
-import { getDocument } from 'pdfjs-dist/legacy/build/pdf.mjs';
+import { getDocument } from 'pdfjs-dist/legacy/build/pdf.mjs'; // Node-safe PDF parsing
 import path from 'path';
 import fs from 'fs';
 import { fileURLToPath } from 'url';
@@ -24,12 +23,10 @@ const {
   TWILIO_ACCOUNT_SID,
   TWILIO_AUTH_TOKEN,
   TWILIO_NUMBER,
-  MESSAGING_SERVICE_SID, // optional, recommended for A2P
-  STAFF_TRANSFER_NUMBER, // optional
+  MESSAGING_SERVICE_SID, // optional (toll‑free/A2P recommended)
   RESTAURANT_NAME = 'Sip & Sizzle',
   RESTAURANT_CITY = 'Fort Myers, FL',
   RESTAURANT_ADDRESS = '2236 First Street, Fort Myers FL 33901',
-  RESTAURANT_PARKING = 'Street parking is free after 5pm across downtown; two parking garages are within a block with plenty of parking.',
   OPEN_TABLE_LINK = 'https://www.opentable.com/r/sip-and-sizzle-reservations-fort-myers?restref=1406116&lang=en-US&ot_source=Lucy',
   TOAST_ORDER_LINK = 'https://order.toasttab.com/online/sip-sizzle-2236-first-street',
   DAY_MENU_LINK = '',
@@ -37,7 +34,7 @@ const {
   BEVERAGE_MENU_LINK = '',
   OPENAI_REALTIME_MODEL = 'gpt-4o-realtime-preview',
   OPENAI_REALTIME_VOICE = 'verse',
-  PUBLIC_HOST
+  PUBLIC_HOST // e.g. sip-sizzle-voice-bot.onrender.com
 } = process.env;
 
 const LISTEN_PORT = process.env.PORT || 3000;
@@ -56,7 +53,22 @@ app.all('/voice-test', (req, res) => {
   res.type('text/xml').send(twiml.toString());
 });
 
-// SMS quick links
+// --- Minimal TwiML streaming route with statusCallback (prevents 11750) ---
+app.all('/voice', (req, res) => {
+  const host = PUBLIC_HOST || req.get('X-Forwarded-Host') || req.get('Host');
+  const httpBase = `https://${host}`;
+  const wssUrl = `wss://${host}/twilio-stream`;
+  const xml = `<?xml version="1.0" encoding="UTF-8"?><Response><Connect><Stream url="${wssUrl}" statusCallback="${httpBase}/stream-status" statusCallbackMethod="POST" statusCallbackEvents="start media stop error"/></Connect></Response>`;
+  res.status(200).type('text/xml').send(xml);
+});
+
+// --- Status callback to see Twilio stream lifecycle ---
+app.post('/stream-status', (req, res) => {
+  console.log('STREAM STATUS:', JSON.stringify(req.body));
+  res.status(200).type('text/xml').send('<?xml version="1.0" encoding="UTF-8"?><Response/>');
+});
+
+// --- SMS quick links (optional) ---
 app.post('/sms', async (req, res) => {
   const { From } = req.body || {};
   const parts = [
@@ -71,14 +83,15 @@ app.post('/sms', async (req, res) => {
   res.status(204).end();
 });
 
-// Menu ingest
+// --- Menu ingest from PDFs (uses pdfjs legacy build) ---
 const MENU_SOURCES = [
   { key: 'Day', url: DAY_MENU_LINK },
   { key: 'Dinner', url: DINNER_MENU_LINK },
   { key: 'Beverage', url: BEVERAGE_MENU_LINK },
 ].filter(s => !!s.url);
 
-let MENU_LINES = [];
+let MENU_LINES = []; // unified list of {source, text}
+
 async function fetchPdfText(url) {
   try {
     const resp = await fetch(url);
@@ -119,7 +132,7 @@ function searchMenuLines(query, limit=8) {
     let score = 0;
     if (hay.includes(q)) score += 3;
     for (const w of tokens) if (w && hay.includes(w)) score += 1;
-    if (/\$\s?\d/.test(r.text)) score += 1;
+    if (/\$\s?\d/.test(r.text)) score += 1; // price hint
     return { r, score };
   }).filter(x => x.score > 0);
   scored.sort((a,b)=> b.score - a.score);
@@ -139,18 +152,10 @@ function formatMenuAnswer(q, rows) {
   return `Here’s what I found:\n${bullets.join('\n')}\n(Items and prices can change; I can confirm with the team.)`;
 }
 
-// load menus at boot
-await ingestMenus();
+// Load menus at boot (non-blocking for Twilio response speed)
+ingestMenus().catch(e => console.error('Menu ingest failed at boot:', e));
 
-// Minimal TwiML (prevents 11750) and explicit host
-app.all('/voice', (req, res) => {
-  const host = PUBLIC_HOST || req.get('X-Forwarded-Host') || req.get('Host');
-  const wssUrl = `wss://${host}/twilio-stream`;
-  const xml = `<?xml version="1.0" encoding="UTF-8"?><Response><Connect><Stream url="${wssUrl}"/></Connect></Response>`;
-  res.status(200).set('Content-Type', 'text/xml').send(xml);
-});
-
-// μ-law helpers
+// --- μ-law helpers (Twilio uses 8kHz) ---
 const BIAS = 0x84, CLIP = 32635;
 const exp_lut = [0,132,396,924,1980,4092,8316,16764];
 function ulawToLinear(ulawByte) {
@@ -191,7 +196,7 @@ function pcm16ToMulawB64(bufPCM16) {
   return out.toString('base64');
 }
 
-// start server + ws
+// Start HTTP server and WS upgrade
 const server = app.listen(LISTEN_PORT, () => console.log(`Voice bot listening on :${LISTEN_PORT}`));
 const wss = new WebSocketServer({ noServer: true });
 server.on('upgrade', (req, socket, head) => {
@@ -199,7 +204,7 @@ server.on('upgrade', (req, socket, head) => {
   wss.handleUpgrade(req, socket, head, (ws) => wss.emit('connection', ws, req));
 });
 
-// Cache callSid -> from number
+// Cache callSid -> from number (for SMS)
 const callFromCache = new Map();
 async function getFromNumber(callSid) {
   if (callFromCache.has(callSid)) return callFromCache.get(callSid);
@@ -226,21 +231,20 @@ wss.on('connection', async (twilioWS, req) => {
   let sentDay = false, sentDinner = false, sentBev = false;
 
   // Buffers
-  const pendingToOpenAI = [];
-  const pendingToTwilio = []; // hold OpenAI audio until Twilio streamSid exists
+  const pendingToOpenAI = []; // caller audio before OA WS open
+  const pendingToTwilio = []; // OA audio before Twilio stream start
 
   const oaHeaders = { 'Authorization': `Bearer ${OPENAI_API_KEY}`, 'OpenAI-Beta': 'realtime=v1' };
   const oaUrl = `wss://api.openai.com/v1/realtime?model=${encodeURIComponent(OPENAI_REALTIME_MODEL)}`;
   const oaWS = new WebSocket(oaUrl, { headers: oaHeaders });
 
-  const greeting = `Thank you for calling ${RESTAURANT_NAME}, located at ${RESTAURANT_ADDRESS} in ${RESTAURANT_CITY}. We are open every day at 10 a.m. for breakfast and lunch, and from 4 p.m. to 10 p.m. for dinner. Happy Hour is 3 to 5 p.m. with five-dollar appetizers and ten-dollar craft cocktails. You can ask me about menu items, prices, wine pairings, reservations, to-go orders, hours, or parking.`;
+  const greeting = `Thank you for calling ${RESTAURANT_NAME}. We’re in ${RESTAURANT_ADDRESS}, ${RESTAURANT_CITY}. We open daily at 10 a.m. for breakfast and lunch, and 4 to 10 p.m. for dinner. Happy Hour is 3 to 5 p.m. Ask me about menu items, prices, wine pairings, reservations, to-go orders, or parking.`;
 
   const instructions =
-`You are the friendly host for ${RESTAURANT_NAME}. Speak naturally and briefly. Never invent prices or availability.
+`You are the friendly host for ${RESTAURANT_NAME}. Speak casually and briefly. Never invent prices or availability.
 
 To look up menu items or prices, emit one token line:
 [[MENU_SEARCH: <query>]]
-Examples: [[MENU_SEARCH: salmon]]  [[MENU_SEARCH: old fashioned]]  [[MENU_SEARCH: ribeye]]
 
 If caller wants links, emit one of:
 [[SEND:MENU_DAY]] [[SEND:MENU_DINNER]] [[SEND:MENU_BEVERAGE]]
@@ -248,9 +252,9 @@ For reservations or to-go: [[SEND:OPENTABLE]] [[SEND:TOAST]]
 
 After emitting a token, continue with a concise spoken answer. Always note that items and prices may change.`;
 
+  // --- OpenAI WS ---
   oaWS.on('open', () => {
     console.log('OpenAI WS open');
-    // Configure session only; DO NOT greet yet (wait for Twilio start)
     oaWS.send(JSON.stringify({
       type: 'session.update',
       session: {
@@ -260,7 +264,17 @@ After emitting a token, continue with a concise spoken answer. Always note that 
         instructions
       }
     }));
+    // If caller audio was buffered before open, flush it now
+    if (pendingToOpenAI.length) {
+      for (const b64 of pendingToOpenAI.splice(0)) {
+        oaWS.send(JSON.stringify({ type: 'input_audio_buffer.append', audio: b64 }));
+      }
+      oaWS.send(JSON.stringify({ type: 'input_audio_buffer.commit' }));
+      oaWS.send(JSON.stringify({ type: 'response.create' }));
+    }
   });
+  oaWS.on('error', (err) => console.error('OpenAI WS error', err));
+  oaWS.on('close', () => { console.log('OpenAI WS closed'); try { twilioWS.close(); } catch {} });
 
   oaWS.on('message', async (data) => {
     try {
@@ -293,7 +307,7 @@ After emitting a token, continue with a concise spoken answer. Always note that 
           if (callSid) { const to = await getFromNumber(callSid); await sendSMS(to, `Sip & Sizzle Beverage Menu: ${BEVERAGE_MENU_LINK}`); }
         }
 
-        // Existing links
+        // Existing tokens for reservations/toast
         if (textBuffer.includes('[[SEND:OPENTABLE]]')) {
           textBuffer = textBuffer.replace('[[SEND:OPENTABLE]]','');
           if (callSid) { const to = await getFromNumber(callSid); await sendSMS(to, `Reservations: ${OPEN_TABLE_LINK}`); }
@@ -306,7 +320,7 @@ After emitting a token, continue with a concise spoken answer. Always note that 
 
       // Buffer OpenAI audio until Twilio streamSid is known and socket OPEN
       if (msg.type === 'output_audio.delta' && msg.audio) {
-        pendingToTwilio.push(msg.audio); // store base64 PCM16 frames
+        pendingToTwilio.push(msg.audio); // base64 PCM16
         flushToTwilio();
       }
     } catch (e) { console.error('OpenAI msg parse error', e); }
@@ -322,23 +336,20 @@ After emitting a token, continue with a concise spoken answer. Always note that 
     }
   }
 
-  oaWS.on('close', () => { console.log('OpenAI WS closed'); try { twilioWS.close(); } catch {} });
-  oaWS.on('error', (err) => console.error('OpenAI WS error', err));
-
-  // Twilio -> OpenAI
+  // --- Twilio WS ---
   twilioWS.on('message', (raw) => {
     const m = JSON.parse(raw.toString());
     if (m.event === 'start') {
       console.log('Twilio start received');
       streamSid = m.start.streamSid;
       callSid = m.start.callSid;
-      // Now that Twilio is ready, trigger the greeting
+      // Now that Twilio is ready, send the greeting
       if (oaWS.readyState === WebSocket.OPEN) {
         oaWS.send(JSON.stringify({ type: 'response.create', response: { instructions: greeting } }));
       }
       flushToTwilio();
     } else if (m.event === 'media' && m.media?.payload) {
-      // Incoming caller audio -> OpenAI (buffer until OA WS open)
+      // Caller audio -> OpenAI (buffer if OA WS not open yet)
       const pcm16 = mulawB64ToPCM16(m.media.payload);
       const b64pcm = Buffer.from(pcm16).toString('base64');
       if (oaWS.readyState === WebSocket.OPEN) {
@@ -356,20 +367,9 @@ After emitting a token, continue with a concise spoken answer. Always note that 
 
   twilioWS.on('close', () => { console.log('Twilio WS closed'); try { oaWS.close(); } catch {} });
   twilioWS.on('error', (err) => console.error('Twilio WS error', err));
-
-  // If OpenAI opens after we buffered caller audio, flush it
-  oaWS.on('open', () => {
-    if (pendingToOpenAI.length) {
-      for (const b64 of pendingToOpenAI.splice(0)) {
-        oaWS.send(JSON.stringify({ type: 'input_audio_buffer.append', audio: b64 }));
-      }
-      oaWS.send(JSON.stringify({ type: 'input_audio_buffer.commit' }));
-      oaWS.send(JSON.stringify({ type: 'response.create' }));
-    }
-  });
 });
 
-// Error guard to keep TwiML small
+// --- Global error guard (keeps TwiML tiny if anything throws) ---
 app.use((err, req, res, next) => {
   console.error('Unhandled error:', err);
   if (req.path === '/voice' || req.path === '/voice-test') {
