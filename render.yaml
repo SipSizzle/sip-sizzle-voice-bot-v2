@@ -2,7 +2,6 @@ services:
   - type: web
     name: sip-sizzle-voice-bot
     env: node
-    region: oregon
     plan: free
     buildCommand: "npm install"
     startCommand: "npm start"
@@ -15,24 +14,25 @@ services:
       - key: TWILIO_AUTH_TOKEN
         sync: false
       - key: TWILIO_NUMBER
-        value: "+12396667974"
+        value: '+12396667974'
       - key: STAFF_TRANSFER_NUMBER
-        value: "+12399105300"
+        value: '+12399105300'
       - key: RESTAURANT_NAME
-        value: "Sip & Sizzle"
+        value: 'Sip & Sizzle'
       - key: RESTAURANT_CITY
-        value: "Fort Myers, FL"
+        value: 'Fort Myers, FL'
       - key: RESTAURANT_ADDRESS
-        value: "2236 First Street, Fort Myers FL 33901"
+        value: '2236 First Street, Fort Myers FL 33901'
       - key: RESTAURANT_PARKING
-        value: "Street parking is free after 5pm across downtown; two parking garages are within a block with plenty of parking."
+        value: 'Street parking is free after 5pm across downtown; two parking garages are within a block with plenty of parking.'
       - key: OPEN_TABLE_LINK
-        value: "https://www.opentable.com/r/sip-and-sizzle-reservations-fort-myers?restref=1406116&lang=en-US&ot_source=Lucy"
+        value: 'https://www.opentable.com/r/sip-and-sizzle-reservations-fort-myers?restref=1406116&lang=en-US&ot_source=Lucy'
       - key: TOAST_ORDER_LINK
-        value: "https://order.toasttab.com/online/sip-sizzle-2236-first-street"
+        value: 'https://order.toasttab.com/online/sip-sizzle-2236-first-street'
       - key: HOURS_JSON
-        value: "{"mon":"10am–10pm","tue":"10am–10pm","wed":"10am–10pm","thu":"10am–10pm","fri":"10am–10pm","sat":"10am–10pm","sun":"10am–10pm"}"
+        value: '{"mon":"10am-10pm","tue":"10am-10pm","wed":"10am-10pm","thu":"10am-10pm","fri":"10am-10pm","sat":"10am-10pm","sun":"10am-10pm"}'
       - key: SPECIALS_JSON
-        value: "[{"name":"Happy Hour Appetizers","price":"$5","notes":"Daily 3–5pm"},{"name":"Top-shelf Craft Cocktails (HH)","price":"$10","notes":"Daily 3–5pm"}]"
+        value: '[{"name":"Happy Hour Appetizers","price":"$5","notes":"Daily 3-5pm"},{"name":"Top-shelf Craft Cocktails (HH)","price":"$10","notes":"Daily 3-5pm"}]'
       - key: PORT
-        value: "3000"
+        value: '3000'
+
