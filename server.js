@@ -4,7 +4,7 @@ import bodyParser from 'body-parser';
 import OpenAI from 'openai';
 import twilio from 'twilio';
 import WebSocket, { WebSocketServer } from 'ws';
-// Use the **legacy** build for Node.js
+// Node-safe PDF parsing (legacy build)
 import { getDocument } from 'pdfjs-dist/legacy/build/pdf.mjs';
 import path from 'path';
 import fs from 'fs';
@@ -85,7 +85,6 @@ async function fetchPdfText(url) {
   try {
     const resp = await fetch(url);
     const buf = Buffer.from(await resp.arrayBuffer());
-    // legacy build works well on Node; no worker config needed
     const loadingTask = getDocument({ data: buf, useWorkerFetch: false, isEvalSupported: false });
     const pdf = await loadingTask.promise;
     let txt = '';
@@ -150,8 +149,8 @@ app.all('/voice', (req, res) => {
   console.log('VOICE webhook hit');
   const twiml = new VoiceResponse();
   const connect = twiml.connect();
-  // IMPORTANT: use 'both_tracks' (two-way audio), not 'both'
-  connect.stream({ url: `wss://${req.headers.host}/twilio-stream`, track: 'both_tracks' });
+  // IMPORTANT: do not set 'track' here. Default inbound_track is required for <Connect><Stream>.
+  connect.stream({ url: `wss://${req.headers.host}/twilio-stream` });
   res.type('text/xml').send(twiml.toString());
 });
 
@@ -197,6 +196,7 @@ function pcm16ToMulawB64(bufPCM16) {
 }
 
 // Start HTTP server and WS upgrade
+const PORT = process.env.PORT || 3000;
 const server = app.listen(PORT, () => console.log(`Voice bot listening on :${PORT}`));
 const wss = new WebSocketServer({ noServer: true });
 server.on('upgrade', (req, socket, head) => {
