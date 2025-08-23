@@ -40,8 +40,11 @@ const {
 
   OPENAI_REALTIME_MODEL = 'gpt-4o-realtime-preview',
   OPENAI_REALTIME_VOICE = 'verse',
-  PORT = process.env.PORT || 3000
+  // NOTE: Do NOT define PORT here to avoid duplicate declarations
 } = process.env;
+
+// Single listen port definition
+const LISTEN_PORT = process.env.PORT || 3000;
 
 const openai = new OpenAI({ apiKey: OPENAI_API_KEY });
 const twilioClient = twilio(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN);
@@ -147,7 +150,7 @@ await ingestMenus();
 // --- Voice: streaming via <Connect><Stream> ---
 app.all('/voice', (req, res) => {
   console.log('VOICE webhook hit');
-  const twiml = new VoiceResponse();
+  const twiml = new (twilio.twiml.VoiceResponse)();
   const connect = twiml.connect();
   // IMPORTANT: do not set 'track' here. Default inbound_track is required for <Connect><Stream>.
   connect.stream({ url: `wss://${req.headers.host}/twilio-stream` });
@@ -196,8 +199,7 @@ function pcm16ToMulawB64(bufPCM16) {
 }
 
 // Start HTTP server and WS upgrade
-const PORT = process.env.PORT || 3000;
-const server = app.listen(PORT, () => console.log(`Voice bot listening on :${PORT}`));
+const server = app.listen(LISTEN_PORT, () => console.log(`Voice bot listening on :${LISTEN_PORT}`));
 const wss = new WebSocketServer({ noServer: true });
 server.on('upgrade', (req, socket, head) => {
   if (!req.url.startsWith('/twilio-stream')) { socket.destroy(); return; }
