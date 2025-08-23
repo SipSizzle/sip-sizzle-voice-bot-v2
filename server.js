@@ -44,6 +44,7 @@ const { VoiceResponse } = twilio.twiml;
 
 // Root check
 app.get('/', (req, res) => res.send('OK'));
+app.get('/health', (req, res) => res.json({ ok: true }));
 
 // TwiML test route
 app.all('/voice-test', (req, res) => {
@@ -70,11 +71,8 @@ app.all('/voice', (req, res) => {
 
 // --- Status callback for Twilio Stream lifecycle ---
 app.post('/stream-status', (req, res) => {
-  try {
-    console.log('STREAM STATUS:', JSON.stringify(req.body));
-  } catch (e) {
-    console.log('STREAM STATUS (raw):', req.body);
-  }
+  try { console.log('STREAM STATUS:', JSON.stringify(req.body)); }
+  catch { console.log('STREAM STATUS (raw):', req.body); }
   res.status(200).type('text/xml').send('<?xml version="1.0" encoding="UTF-8"?><Response/>');
 });
 
@@ -213,7 +211,7 @@ function pcm16ToMulawB64(bufPCM16) {
 }
 
 // Generate a short 440Hz tone (beep) in PCM16 at 8kHz
-function tonePCM16(freq = 440, ms = 400, sampleRate = 8000) {
+function tonePCM16(freq = 440, ms = 300, sampleRate = 8000) {
   const samples = Math.floor(sampleRate * (ms / 1000));
   const buf = Buffer.alloc(samples * 2);
   const amp = 10000;
@@ -231,9 +229,7 @@ const server = app.listen(LISTEN_PORT, () => console.log(`Voice bot listening on
 
 // WebSocket server mounted with path
 const wss = new WebSocketServer({ server, path: '/twilio-stream' });
-wss.on('headers', (headers, req) => {
-  console.log('WS upgrade headers sent for', req.url);
-});
+wss.on('headers', (headers, req) => { console.log('WS upgrade headers sent for', req.url); });
 
 // Cache callSid -> from number (for SMS)
 const callFromCache = new Map();
@@ -265,6 +261,10 @@ wss.on('connection', async (twilioWS, req) => {
   const pendingToOpenAI = []; // caller audio before OA WS open
   const pendingToTwilio = []; // OA audio before Twilio stream start
 
+  let twilioReady = false;
+  let oaReady = false;
+  let greetingSent = false;
+
   const oaHeaders = { 'Authorization': `Bearer ${OPENAI_API_KEY}`, 'OpenAI-Beta': 'realtime=v1' };
   const oaUrl = `wss://api.openai.com/v1/realtime?model=${encodeURIComponent(OPENAI_REALTIME_MODEL)}`;
   const oaWS = new WebSocket(oaUrl, { headers: oaHeaders });
@@ -283,12 +283,25 @@ For reservations or to-go: [[SEND:OPENTABLE]] [[SEND:TOAST]]
 
 After emitting a token, continue with a concise spoken answer. Always note that items and prices may change.`;
 
+  function maybeStartGreeting() {
+    if (twilioReady && oaReady && !greetingSent) {
+      greetingSent = true;
+      console.log('Sending AI greeting (audio)…');
+      oaWS.send(JSON.stringify({
+        type: 'response.create',
+        response: { modalities: ['audio'], instructions: greeting }
+      }));
+    }
+  }
+
   // --- OpenAI WS ---
   oaWS.on('open', () => {
     console.log('OpenAI WS open');
+    oaReady = true;
     oaWS.send(JSON.stringify({
       type: 'session.update',
       session: {
+        modalities: ['audio'],
         voice: OPENAI_REALTIME_VOICE,
         input_audio_format: { type: 'pcm16', sample_rate_hz: 8000 },
         output_audio_format: { type: 'pcm16', sample_rate_hz: 8000 },
@@ -301,8 +314,9 @@ After emitting a token, continue with a concise spoken answer. Always note that 
         oaWS.send(JSON.stringify({ type: 'input_audio_buffer.append', audio: b64 }));
       }
       oaWS.send(JSON.stringify({ type: 'input_audio_buffer.commit' }));
-      oaWS.send(JSON.stringify({ type: 'response.create' }));
+      oaWS.send(JSON.stringify({ type: 'response.create', response: { modalities: ['audio'] } }));
     }
+    maybeStartGreeting();
   });
   oaWS.on('error', (err) => console.error('OpenAI WS error', err));
   oaWS.on('close', () => { console.log('OpenAI WS closed'); try { twilioWS.close(); } catch {} });
@@ -321,7 +335,8 @@ After emitting a token, continue with a concise spoken answer. Always note that 
           textBuffer = textBuffer.replace(m[0], '');
           const rows = searchMenuLines(q, 8);
           const spoken = formatMenuAnswer(q, rows);
-          oaWS.send(JSON.stringify({ type: 'response.create', response: { instructions: spoken } }));
+          console.log('Sending menu answer (audio)…');
+          oaWS.send(JSON.stringify({ type: 'response.create', response: { modalities: ['audio'], instructions: spoken } }));
         }
 
         // SEND LINKS
@@ -369,7 +384,7 @@ After emitting a token, continue with a concise spoken answer. Always note that 
 
   function sendBeep() {
     if (!streamSid || twilioWS.readyState !== WebSocket.OPEN) return;
-    const beep = tonePCM16(440, 350, 8000);
+    const beep = tonePCM16(440, 300, 8000);
     const b64Mu = pcm16ToMulawB64(beep);
     twilioWS.send(JSON.stringify({ event: 'media', streamSid, media: { payload: b64Mu } }));
   }
@@ -383,12 +398,9 @@ After emitting a token, continue with a concise spoken answer. Always note that 
         console.log('Twilio start received');
         streamSid = m.start.streamSid;
         callSid = m.start.callSid;
+        twilioReady = true;
         sendBeep(); // prove outbound audio path
-        // Now that Twilio is ready, send the greeting
-        if (oaWS.readyState === WebSocket.OPEN) {
-          oaWS.send(JSON.stringify({ type: 'response.create', response: { instructions: greeting } }));
-        }
-        flushToTwilio();
+        maybeStartGreeting();
       } else if (m.event === 'media' && m.media?.payload) {
         // Caller audio -> OpenAI (buffer if OA WS not open yet)
         const pcm16 = mulawB64ToPCM16(m.media.payload);
@@ -396,7 +408,7 @@ After emitting a token, continue with a concise spoken answer. Always note that 
         if (oaWS.readyState === WebSocket.OPEN) {
           oaWS.send(JSON.stringify({ type: 'input_audio_buffer.append', audio: b64pcm }));
           oaWS.send(JSON.stringify({ type: 'input_audio_buffer.commit' }));
-          oaWS.send(JSON.stringify({ type: 'response.create' }));
+          oaWS.send(JSON.stringify({ type: 'response.create', response: { modalities: ['audio'] } }));
         } else {
           pendingToOpenAI.push(b64pcm);
         }
