@@ -25,7 +25,7 @@ const {
   TWILIO_AUTH_TOKEN,
   TWILIO_NUMBER,
   MESSAGING_SERVICE_SID, // optional, recommended for A2P
-  STAFF_TRANSFER_NUMBER, // optional, not used unless you add transfer
+  STAFF_TRANSFER_NUMBER, // optional
   RESTAURANT_NAME = 'Sip & Sizzle',
   RESTAURANT_CITY = 'Fort Myers, FL',
   RESTAURANT_ADDRESS = '2236 First Street, Fort Myers FL 33901',
@@ -40,6 +40,7 @@ const {
 
   OPENAI_REALTIME_MODEL = 'gpt-4o-realtime-preview',
   OPENAI_REALTIME_VOICE = 'verse',
+  PUBLIC_HOST // optional override like: sip-sizzle-voice-bot.onrender.com
 } = process.env;
 
 // Single listen port definition
@@ -146,14 +147,15 @@ function formatMenuAnswer(q, rows) {
 // refresh menus at startup
 await ingestMenus();
 
-// --- Voice: streaming via <Connect><Stream> ---
+/**
+ * --- Voice: streaming via <Connect><Stream> ---
+ * Minimal TwiML string (prevents 11750) + no 'track' attribute.
+ */
 app.all('/voice', (req, res) => {
-  console.log('VOICE webhook hit');
-  const twiml = new (twilio.twiml.VoiceResponse)();
-  const connect = twiml.connect();
-  // IMPORTANT: do not set 'track' here. Default inbound_track is required for <Connect><Stream>.
-  connect.stream({ url: `wss://${req.headers.host}/twilio-stream` });
-  res.type('text/xml').send(twiml.toString());
+  const host = PUBLIC_HOST || req.get('X-Forwarded-Host') || req.get('Host');
+  const wssUrl = `wss://${host}/twilio-stream`;
+  const xml = `<?xml version="1.0" encoding="UTF-8"?><Response><Connect><Stream url="${wssUrl}"/></Connect></Response>`;
+  res.status(200).set('Content-Type', 'text/xml').send(xml);
 });
 
 // --- μ-law helpers (Twilio uses 8kHz) ---
@@ -346,7 +348,7 @@ After emitting a token, continue with a concise spoken answer. Always note that 
     if (m.event === 'start') {
       streamSid = m.start.streamSid;
       callSid = m.start.callSid;
-      // Prime the model
+      // Prime the model only if ready
       if (oaWS.readyState === WebSocket.OPEN) {
         oaWS.send(JSON.stringify({ type: 'response.create', response: { instructions: '' } }));
       }
@@ -363,3 +365,14 @@ After emitting a token, continue with a concise spoken answer. Always note that 
   twilioWS.on('close', () => { try { oaWS.close(); } catch {} });
   twilioWS.on('error', (err) => console.error('Twilio WS error', err));
 });
+
+// --- Global error guard (prevents 11750 by always returning tiny TwiML) ---
+app.use((err, req, res, next) => {
+  console.error('Unhandled error:', err);
+  if (req.path === '/voice' || req.path === '/voice-test') {
+    res.status(200).type('text/xml').send('<?xml version="1.0" encoding="UTF-8"?><Response/>');
+  } else {
+    res.status(500).send('');
+  }
+});
+
