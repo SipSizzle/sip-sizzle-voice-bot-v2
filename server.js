@@ -52,16 +52,14 @@ app.all('/voice-test', (req, res) => {
   res.type('text/xml').send(twiml.toString());
 });
 
-// --- Minimal TwiML streaming route using Twilio helper (prevents 12100 by escaping XML) ---
+// --- Minimal TwiML streaming route using Twilio helper ---
+function safeForSpeech(s) { return String(s || '').replace(/&/g, 'and'); }
 app.all('/voice', (req, res) => {
   const host = PUBLIC_HOST || req.get('X-Forwarded-Host') || req.get('Host');
   const wssUrl = `wss://${host}/twilio-stream`;
 
-  // Replace & with 'and' in spoken content to avoid XML entity issues.
-  const safeName = (RESTAURANT_NAME || '').replace(/&/g, 'and');
-
   const twiml = new VoiceResponse();
-  twiml.say({ voice: 'alice' }, `Thank you for calling ${safeName}. One moment while I connect you.`);
+  twiml.say({ voice: 'alice' }, `Thank you for calling ${safeForSpeech(RESTAURANT_NAME)}. One moment while I connect you.`);
   const connect = twiml.connect();
   connect.stream({ url: wssUrl });
 
@@ -202,12 +200,13 @@ function pcm16ToMulawB64(bufPCM16) {
   return out.toString('base64');
 }
 
-// Start HTTP server and WS upgrade
+// Start HTTP server
 const server = app.listen(LISTEN_PORT, () => console.log(`Voice bot listening on :${LISTEN_PORT}`));
-const wss = new WebSocketServer({ noServer: true });
-server.on('upgrade', (req, socket, head) => {
-  if (!req.url.startsWith('/twilio-stream')) { socket.destroy(); return; }
-  wss.handleUpgrade(req, socket, head, (ws) => wss.emit('connection', ws, req));
+
+// WebSocket server mounted with path (lets ws handle the upgrade/handshake)
+const wss = new WebSocketServer({ server, path: '/twilio-stream' });
+wss.on('headers', (headers, req) => {
+  console.log('WS upgrade headers sent for', req.url);
 });
 
 // Cache callSid -> from number (for SMS)
@@ -230,7 +229,7 @@ async function sendSMS(to, body) {
 
 // --- WS per call: bridge Twilio ↔ OpenAI Realtime ---
 wss.on('connection', async (twilioWS, req) => {
-  console.log('Twilio WS connected');
+  console.log('Twilio WS connected', req.url);
   let streamSid = null;
   let callSid = null;
   let textBuffer = "";
@@ -257,8 +256,6 @@ If caller wants links, emit one of:
 For reservations or to-go: [[SEND:OPENTABLE]] [[SEND:TOAST]]
 
 After emitting a token, continue with a concise spoken answer. Always note that items and prices may change.`;
-
-  function safeForSpeech(s) { return String(s || '').replace(/&/g, 'and'); }
 
   // --- OpenAI WS ---
   oaWS.on('open', () => {
@@ -373,7 +370,7 @@ After emitting a token, continue with a concise spoken answer. Always note that 
     }
   });
 
-  twilioWS.on('close', () => { console.log('Twilio WS closed'); try { oaWS.close(); } catch {} });
+  twilioWS.on('close', (code, reason) => { console.log('Twilio WS closed', code, reason?.toString()); try { oaWS.close(); } catch {} });
   twilioWS.on('error', (err) => console.error('Twilio WS error', err));
 });
 
