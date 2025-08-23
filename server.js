@@ -12,7 +12,6 @@ const app = express();
 app.use(bodyParser.urlencoded({ extended: false }));
 app.use(bodyParser.json());
 
-// Static (optional) for hosting any files
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 app.use('/public', express.static(path.join(__dirname, 'public')));
 
@@ -55,7 +54,7 @@ app.all('/voice-test', (req, res) => {
 
 function safeForSpeech(s) { return String(s || '').replace(/&/g, 'and'); }
 
-// --- Minimal TwiML streaming route using Twilio helper + statusCallback (no events attr) ---
+// --- Minimal TwiML streaming route ---
 app.all('/voice', (req, res) => {
   const host = PUBLIC_HOST || req.get('X-Forwarded-Host') || req.get('Host');
   const httpBase = `https://${host}`;
@@ -69,7 +68,6 @@ app.all('/voice', (req, res) => {
   res.status(200).type('text/xml').send(twiml.toString());
 });
 
-// --- Status callback for Twilio Stream lifecycle ---
 app.post('/stream-status', (req, res) => {
   try { console.log('STREAM STATUS:', JSON.stringify(req.body)); }
   catch { console.log('STREAM STATUS (raw):', req.body); }
@@ -146,7 +144,7 @@ function searchMenuLines(query, limit=8) {
     let score = 0;
     if (hay.includes(q)) score += 3;
     for (const w of tokens) if (w && hay.includes(w)) score += 1;
-    if (/\$\s?\d/.test(r.text)) score += 1; // price hint
+    if (/\$\s?\d/.test(r.text)) score += 1;
     return { r, score };
   }).filter(x => x.score > 0);
   scored.sort((a,b)=> b.score - a.score);
@@ -166,68 +164,10 @@ function formatMenuAnswer(q, rows) {
   return `Here’s what I found:\n${bullets.join('\n')}\n(Items and prices can change; I can confirm with the team.)`;
 }
 
-// Start ingest (non-blocking). If PDFs are funky, this can ingest zero; voice still works.
 ingestMenus().catch(e => console.error('Menu ingest failed at boot:', e));
 
-// --- μ-law helpers (Twilio uses 8kHz) ---
-const exp_lut = [0,132,396,924,1980,4092,8316,16764];
-function ulawToLinear(ulawByte) {
-  ulawByte = ~ulawByte & 0xff;
-  const sign = (ulawByte & 0x80);
-  const exponent = (ulawByte >> 4) & 0x07;
-  const mantissa = ulawByte & 0x0f;
-  let sample = exp_lut[exponent] + (mantissa << (exponent + 3));
-  if (sign) sample = -sample;
-  return sample;
-}
-function linearToUlaw(sample) {
-  let sign = (sample >> 8) & 0x80;
-  if (sign) sample = -sample;
-  const CLIP = 32635;
-  if (sample > CLIP) sample = CLIP;
-  let exponent = 7;
-  for (let expMask = 0x4000; (sample & expMask) === 0 && exponent > 0; exponent--, expMask >>= 1) {}
-  let mantissa = (sample >> (exponent + 3)) & 0x0f;
-  const ulawByte = ~(sign | (exponent << 4) | mantissa);
-  return ulawByte & 0xff;
-}
-function mulawB64ToPCM16(b64) {
-  const mu = Buffer.from(b64, 'base64');
-  const out = Buffer.alloc(mu.length * 2);
-  for (let i = 0; i < mu.length; i++) {
-    const s = ulawToLinear(mu[i]);
-    out.writeInt16LE(s, i*2);
-  }
-  return out; // 8kHz PCM16 LE
-}
-function pcm16ToMulawB64(bufPCM16) {
-  const frames = bufPCM16.length / 2;
-  const out = Buffer.alloc(frames);
-  for (let i = 0; i < frames; i++) {
-    const s = bufPCM16.readInt16LE(i*2);
-    out[i] = linearToUlaw(s);
-  }
-  return out.toString('base64');
-}
-
-// Generate a short 440Hz tone (beep) in PCM16 at 8kHz
-function tonePCM16(freq = 440, ms = 300, sampleRate = 8000) {
-  const samples = Math.floor(sampleRate * (ms / 1000));
-  const buf = Buffer.alloc(samples * 2);
-  const amp = 10000;
-  for (let i = 0; i < samples; i++) {
-    const t = i / sampleRate;
-    const v = Math.sin(2 * Math.PI * freq * t);
-    const s = Math.max(-1, Math.min(1, v)) * amp;
-    buf.writeInt16LE(s, i*2);
-  }
-  return buf;
-}
-
-// Start HTTP server
+// --- Start HTTP server + WS ---
 const server = app.listen(LISTEN_PORT, () => console.log(`Voice bot listening on :${LISTEN_PORT}`));
-
-// WebSocket server mounted with path
 const wss = new WebSocketServer({ server, path: '/twilio-stream' });
 wss.on('headers', (headers, req) => { console.log('WS upgrade headers sent for', req.url); });
 
@@ -239,7 +179,6 @@ async function getFromNumber(callSid) {
   callFromCache.set(callSid, call.from);
   return call.from;
 }
-
 async function sendSMS(to, body) {
   const suffix = " Reply STOP to opt out. HELP for help. Msg&data rates may apply.";
   const finalBody = body.endsWith(suffix) ? body : (body + suffix);
@@ -249,7 +188,7 @@ async function sendSMS(to, body) {
   return twilioClient.messages.create({ to, from: TWILIO_NUMBER, body: finalBody });
 }
 
-// --- WS per call: bridge Twilio ↔ OpenAI Realtime ---
+// --- WS per call: Twilio ↔ OpenAI Realtime (μ-law passthrough + VAD) ---
 wss.on('connection', async (twilioWS, req) => {
   console.log('Twilio WS connected', req.url);
   let streamSid = null;
@@ -257,15 +196,15 @@ wss.on('connection', async (twilioWS, req) => {
   let textAccum = "";
   let sentDay = false, sentDinner = false, sentBev = false;
 
-  // Audio commit threshold (>=100ms at 8kHz = 800 samples)
-  let samplesSinceCommit = 0;
+  // Buffer and state
+  let bytesSinceCommit = 0; // μ-law bytes (1 byte per 8k sample)
+  const COMMIT_BYTES = 1600; // 200ms at 8kHz
 
-  // Buffers
-  const pendingToTwilio = []; // OA audio before Twilio stream start
-
+  const pendingToTwilio = [];
   let twilioReady = false;
   let oaReady = false;
   let greetingSent = false;
+  let activeResponse = false; // track OA response lifecycle
 
   const oaHeaders = { 'Authorization': `Bearer ${OPENAI_API_KEY}`, 'OpenAI-Beta': 'realtime=v1' };
   const oaUrl = `wss://api.openai.com/v1/realtime?model=${encodeURIComponent(OPENAI_REALTIME_MODEL)}`;
@@ -286,8 +225,9 @@ For reservations or to-go: [[SEND:OPENTABLE]] [[SEND:TOAST]]
 After emitting a token, continue with a concise spoken answer. Always note that items and prices may change.`;
 
   function maybeStartGreeting() {
-    if (twilioReady && oaReady && !greetingSent) {
+    if (twilioReady && oaReady && !greetingSent && !activeResponse) {
       greetingSent = true;
+      activeResponse = true;
       console.log('Sending AI greeting (audio+text)…');
       oaWS.send(JSON.stringify({
         type: 'response.create',
@@ -305,8 +245,9 @@ After emitting a token, continue with a concise spoken answer. Always note that 
       session: {
         modalities: ['audio','text'],
         voice: OPENAI_REALTIME_VOICE,
-        input_audio_format: { type: 'pcm16', sample_rate_hz: 8000 },
-        output_audio_format: { type: 'pcm16', sample_rate_hz: 8000 },
+        input_audio_format: { type: 'mulaw', sample_rate_hz: 8000 },
+        output_audio_format: { type: 'mulaw', sample_rate_hz: 8000 },
+        turn_detection: { type: 'server_vad', threshold: 0.5, prefix_padding_ms: 150, silence_duration_ms: 500 },
         instructions
       }
     }));
@@ -319,26 +260,27 @@ After emitting a token, continue with a concise spoken answer. Always note that 
     try {
       const msg = JSON.parse(data.toString());
 
-      // Helpful debug
-      if (msg.type === 'response.created') console.log('OA response.created');
-      if (msg.type === 'response.done') console.log('OA response.done');
-      if (msg.type === 'error') console.error('OA ERROR:', msg.error || msg);
+      if (msg.type === 'response.created') { activeResponse = true; console.log('OA response.created'); }
+      if (msg.type === 'response.done') { activeResponse = false; console.log('OA response.done'); }
+      if (msg.type === 'error') { console.error('OA ERROR:', msg.error || msg); }
 
       if (msg.type === 'response.text.delta' && msg.delta) {
         textAccum += msg.delta;
 
-        // MENU SEARCH
         const m = textAccum.match(/\[\[MENU_SEARCH:\s*([^\]]+)\]\]/i);
         if (m) {
           const q = m[1].trim();
           textAccum = textAccum.replace(m[0], '');
           const rows = searchMenuLines(q, 8);
           const spoken = formatMenuAnswer(q, rows);
-          console.log('Sending menu answer (audio+text)…');
-          oaWS.send(JSON.stringify({ type: 'response.create', response: { modalities: ['audio','text'], instructions: spoken } }));
+          // Queue a follow-up spoken answer if no response is active
+          if (!activeResponse) {
+            activeResponse = true;
+            console.log('Sending menu answer (audio+text)…');
+            oaWS.send(JSON.stringify({ type: 'response.create', response: { modalities: ['audio','text'], instructions: spoken } }));
+          }
         }
 
-        // SEND LINKS
         if (!sentDay && DAY_MENU_LINK && textAccum.includes('[[SEND:MENU_DAY]]')) {
           sentDay = true; textAccum = textAccum.replace('[[SEND:MENU_DAY]]','');
           if (callSid) { const to = await getFromNumber(callSid); await sendSMS(to, `Sip & Sizzle Day Menu: ${DAY_MENU_LINK}`); }
@@ -352,7 +294,6 @@ After emitting a token, continue with a concise spoken answer. Always note that 
           if (callSid) { const to = await getFromNumber(callSid); await sendSMS(to, `Sip & Sizzle Beverage Menu: ${BEVERAGE_MENU_LINK}`); }
         }
 
-        // Existing tokens for reservations/toast
         if (textAccum.includes('[[SEND:OPENTABLE]]')) {
           textAccum = textAccum.replace('[[SEND:OPENTABLE]]','');
           if (callSid) { const to = await getFromNumber(callSid); await sendSMS(to, `Reservations: ${OPEN_TABLE_LINK}`); }
@@ -363,9 +304,8 @@ After emitting a token, continue with a concise spoken answer. Always note that 
         }
       }
 
-      // Correct audio event name & field
       if (msg.type === 'response.audio.delta' && msg.delta) {
-        pendingToTwilio.push(msg.delta); // base64 PCM16 from OpenAI
+        pendingToTwilio.push(msg.delta);
         flushToTwilio();
       }
     } catch (e) { console.error('OpenAI msg parse error', e); }
@@ -375,16 +315,35 @@ After emitting a token, continue with a concise spoken answer. Always note that 
     if (!streamSid) return;
     if (twilioWS.readyState !== WebSocket.OPEN) return;
     while (pendingToTwilio.length) {
-      const b64pcm = pendingToTwilio.shift();
-      const b64Mu = pcm16ToMulawB64(Buffer.from(b64pcm, 'base64'));
-      twilioWS.send(JSON.stringify({ event: 'media', streamSid, media: { payload: b64Mu } }));
+      const b64mu = pendingToTwilio.shift();
+      twilioWS.send(JSON.stringify({ event: 'media', streamSid, media: { payload: b64mu } }));
     }
   }
 
   function sendBeep() {
     if (!streamSid || twilioWS.readyState !== WebSocket.OPEN) return;
-    const beep = tonePCM16(440, 300, 8000);
-    const b64Mu = pcm16ToMulawB64(beep);
+    // μ-law 8k tone generation (inline to avoid resample)
+    const sampleRate = 8000, ms = 250, freq = 440;
+    const samples = Math.floor(sampleRate * (ms / 1000));
+    const amp = 10000;
+    const mu = Buffer.alloc(samples);
+    for (let i = 0; i < samples; i++) {
+      const t = i / sampleRate;
+      const v = Math.sin(2 * Math.PI * freq * t);
+      const s = Math.max(-1, Math.min(1, v)) * amp;
+      // linearToUlaw
+      let sign = (s >> 8) & 0x80;
+      let val = s;
+      if (sign) val = -val;
+      const CLIP = 32635;
+      if (val > CLIP) val = CLIP;
+      let exponent = 7;
+      for (let expMask = 0x4000; (val & expMask) === 0 && exponent > 0; exponent--, expMask >>= 1) {}
+      let mantissa = (val >> (exponent + 3)) & 0x0f;
+      const ulawByte = ~(sign | (exponent << 4) | mantissa);
+      mu[i] = ulawByte & 0xff;
+    }
+    const b64Mu = mu.toString('base64');
     twilioWS.send(JSON.stringify({ event: 'media', streamSid, media: { payload: b64Mu } }));
   }
 
@@ -392,28 +351,24 @@ After emitting a token, continue with a concise spoken answer. Always note that 
   twilioWS.on('message', (raw) => {
     try {
       const m = JSON.parse(raw.toString());
-      // console.log('TWILIO EVENT:', m.event); // noisy
+      // console.log('TWILIO EVENT:', m.event);
       if (m.event === 'start') {
         console.log('Twilio start received');
         streamSid = m.start.streamSid;
         callSid = m.start.callSid;
         twilioReady = true;
-        samplesSinceCommit = 0;
-        sendBeep(); // prove outbound audio path
+        bytesSinceCommit = 0;
+        sendBeep();
         maybeStartGreeting();
       } else if (m.event === 'media' && m.media?.payload) {
-        // Caller audio -> OpenAI: append each chunk, commit only when >=100ms since last commit
-        const pcm16 = mulawB64ToPCM16(m.media.payload);
-        const samples = pcm16.length / 2;
-        const b64pcm = Buffer.from(pcm16).toString('base64');
-
+        const b64mu = m.media.payload; // base64 μ-law 8k
         if (oaWS.readyState === WebSocket.OPEN) {
-          oaWS.send(JSON.stringify({ type: 'input_audio_buffer.append', audio: b64pcm }));
-          samplesSinceCommit += samples;
-          if (samplesSinceCommit >= 800) { // >=100ms at 8kHz
+          oaWS.send(JSON.stringify({ type: 'input_audio_buffer.append', audio: b64mu }));
+          bytesSinceCommit += Buffer.from(b64mu, 'base64').length;
+          if (bytesSinceCommit >= COMMIT_BYTES) {
             oaWS.send(JSON.stringify({ type: 'input_audio_buffer.commit' }));
-            oaWS.send(JSON.stringify({ type: 'response.create', response: { modalities: ['audio','text'] } }));
-            samplesSinceCommit = 0;
+            // Do NOT send response.create here — rely on server VAD to trigger
+            bytesSinceCommit = 0;
           }
         }
       } else if (m.event === 'stop') {
