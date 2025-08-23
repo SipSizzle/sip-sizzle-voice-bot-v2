@@ -4,10 +4,13 @@ import bodyParser from 'body-parser';
 import OpenAI from 'openai';
 import twilio from 'twilio';
 import WebSocket, { WebSocketServer } from 'ws';
-import pdf from 'pdf-parse';
+import * as pdfjsLib from 'pdfjs-dist';
+import pdfjsWorker from 'pdfjs-dist/build/pdf.worker.mjs';
 import path from 'path';
 import fs from 'fs';
 import { fileURLToPath } from 'url';
+
+pdfjsLib.GlobalWorkerOptions.workerSrc = pdfjsWorker;
 
 const app = express();
 app.use(bodyParser.urlencoded({ extended: false }));
@@ -52,19 +55,19 @@ app.get('/', (req, res) => res.send('OK'));
 // --- SMS endpoint (optional: sends quick links on inbound SMS) ---
 app.post('/sms', async (req, res) => {
   const { From, Body } = req.body || {};
-  const lower = (Body || '').toLowerCase();
-  let msg = `Thanks for contacting ${RESTAURANT_NAME}! Reservations: ${OPEN_TABLE_LINK}  |  Pickup: ${TOAST_ORDER_LINK}`;
-  if (DAY_MENU_LINK || DINNER_MENU_LINK || BEVERAGE_MENU_LINK) {
-    msg += `  |  Menus:`;
-    if (DAY_MENU_LINK) msg += ` Day ${DAY_MENU_LINK}`;
-    if (DINNER_MENU_LINK) msg += ` Dinner ${DINNER_MENU_LINK}`;
-    if (BEVERAGE_MENU_LINK) msg += ` Beverage ${BEVERAGE_MENU_LINK}`;
-  }
-  try { await sendSMS(From, msg); } catch (e) { console.error('SMS auto-reply failed', e.message); }
+  const msgParts = [
+    `Thanks for contacting ${RESTAURANT_NAME}!`,
+    `Reservations: ${OPEN_TABLE_LINK}`,
+    `Pickup: ${TOAST_ORDER_LINK}`
+  ];
+  if (DAY_MENU_LINK) msgParts.push(`Day Menu: ${DAY_MENU_LINK}`);
+  if (DINNER_MENU_LINK) msgParts.push(`Dinner Menu: ${DINNER_MENU_LINK}`);
+  if (BEVERAGE_MENU_LINK) msgParts.push(`Beverage Menu: ${BEVERAGE_MENU_LINK}`);
+  try { await sendSMS(From, msgParts.join('  |  ')); } catch (e) { console.error('SMS auto-reply failed', e.message); }
   res.status(204).end();
 });
 
-// --- Menu ingest from PDFs ---
+// --- Menu ingest from PDFs (using pdfjs-dist) ---
 const MENU_SOURCES = [
   { key: 'Day', url: DAY_MENU_LINK },
   { key: 'Dinner', url: DINNER_MENU_LINK },
@@ -76,10 +79,18 @@ async function fetchPdfText(url) {
   try {
     const resp = await fetch(url);
     const buf = Buffer.from(await resp.arrayBuffer());
-    const data = await pdf(buf);
-    return data.text || '';
+    const loadingTask = pdfjsLib.getDocument({ data: buf });
+    const pdf = await loadingTask.promise;
+    let txt = '';
+    for (let i = 1; i <= pdf.numPages; i++) {
+      const page = await pdf.getPage(i);
+      const content = await page.getTextContent();
+      const strings = content.items.map(it => (typeof it.str === 'string' ? it.str : '')).filter(Boolean);
+      txt += strings.join(' ') + '\n';
+    }
+    return txt;
   } catch (e) {
-    console.error('Failed to fetch/parse PDF', url, e.message);
+    console.error('Failed to fetch/parse PDF', url, e);
     return '';
   }
 }
@@ -104,7 +115,6 @@ function searchMenuLines(query, limit=8) {
     let score = 0;
     if (hay.includes(q)) score += 3;
     for (const w of tokens) if (w && hay.includes(w)) score += 1;
-    // price boost
     if (/\$\s?\d/.test(r.text)) score += 1;
     return { r, score };
   }).filter(x => x.score > 0);
@@ -129,7 +139,7 @@ function formatMenuAnswer(q, rows) {
 // refresh menus at startup
 await ingestMenus();
 
-// --- Voice: switch to streaming via <Connect><Stream> ---
+// --- Voice: streaming via <Connect><Stream> ---
 app.post('/voice', (req, res) => {
   const twiml = new VoiceResponse();
   // Optional: play recorded greeting here
@@ -277,7 +287,7 @@ After emitting a token, continue with a concise spoken answer. Always note that 
           if (callSid) { const to = await getFromNumber(callSid); await sendSMS(to, `Sip & Sizzle Beverage Menu: ${BEVERAGE_MENU_LINK}`); }
         }
 
-        // Also support existing tokens for reservations/toast
+        // Existing tokens
         if (textBuffer.includes('[[SEND:OPENTABLE]]')) {
           textBuffer = textBuffer.replace('[[SEND:OPENTABLE]]','');
           if (callSid) { const to = await getFromNumber(callSid); await sendSMS(to, `Reservations: ${OPEN_TABLE_LINK}`); }
