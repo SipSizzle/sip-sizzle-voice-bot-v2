@@ -254,11 +254,13 @@ wss.on('connection', async (twilioWS, req) => {
   console.log('Twilio WS connected', req.url);
   let streamSid = null;
   let callSid = null;
-  let textBuffer = "";
+  let textAccum = "";
   let sentDay = false, sentDinner = false, sentBev = false;
 
+  // Audio commit threshold (>=100ms at 8kHz = 800 samples)
+  let samplesSinceCommit = 0;
+
   // Buffers
-  const pendingToOpenAI = []; // caller audio before OA WS open
   const pendingToTwilio = []; // OA audio before Twilio stream start
 
   let twilioReady = false;
@@ -286,10 +288,10 @@ After emitting a token, continue with a concise spoken answer. Always note that 
   function maybeStartGreeting() {
     if (twilioReady && oaReady && !greetingSent) {
       greetingSent = true;
-      console.log('Sending AI greeting (audio)…');
+      console.log('Sending AI greeting (audio+text)…');
       oaWS.send(JSON.stringify({
         type: 'response.create',
-        response: { modalities: ['audio'], instructions: greeting }
+        response: { modalities: ['audio','text'], instructions: greeting }
       }));
     }
   }
@@ -301,21 +303,13 @@ After emitting a token, continue with a concise spoken answer. Always note that 
     oaWS.send(JSON.stringify({
       type: 'session.update',
       session: {
-        modalities: ['audio'],
+        modalities: ['audio','text'],
         voice: OPENAI_REALTIME_VOICE,
         input_audio_format: { type: 'pcm16', sample_rate_hz: 8000 },
         output_audio_format: { type: 'pcm16', sample_rate_hz: 8000 },
         instructions
       }
     }));
-    // If caller audio was buffered before open, flush it now
-    if (pendingToOpenAI.length) {
-      for (const b64 of pendingToOpenAI.splice(0)) {
-        oaWS.send(JSON.stringify({ type: 'input_audio_buffer.append', audio: b64 }));
-      }
-      oaWS.send(JSON.stringify({ type: 'input_audio_buffer.commit' }));
-      oaWS.send(JSON.stringify({ type: 'response.create', response: { modalities: ['audio'] } }));
-    }
     maybeStartGreeting();
   });
   oaWS.on('error', (err) => console.error('OpenAI WS error', err));
@@ -331,40 +325,40 @@ After emitting a token, continue with a concise spoken answer. Always note that 
       if (msg.type === 'error') console.error('OA ERROR:', msg.error || msg);
 
       if (msg.type === 'response.text.delta' && msg.delta) {
-        textBuffer += msg.delta;
+        textAccum += msg.delta;
 
         // MENU SEARCH
-        const m = textBuffer.match(/\[\[MENU_SEARCH:\s*([^\]]+)\]\]/i);
+        const m = textAccum.match(/\[\[MENU_SEARCH:\s*([^\]]+)\]\]/i);
         if (m) {
           const q = m[1].trim();
-          textBuffer = textBuffer.replace(m[0], '');
+          textAccum = textAccum.replace(m[0], '');
           const rows = searchMenuLines(q, 8);
           const spoken = formatMenuAnswer(q, rows);
-          console.log('Sending menu answer (audio)…');
-          oaWS.send(JSON.stringify({ type: 'response.create', response: { modalities: ['audio'], instructions: spoken } }));
+          console.log('Sending menu answer (audio+text)…');
+          oaWS.send(JSON.stringify({ type: 'response.create', response: { modalities: ['audio','text'], instructions: spoken } }));
         }
 
         // SEND LINKS
-        if (!sentDay && DAY_MENU_LINK && textBuffer.includes('[[SEND:MENU_DAY]]')) {
-          sentDay = true; textBuffer = textBuffer.replace('[[SEND:MENU_DAY]]','');
+        if (!sentDay && DAY_MENU_LINK && textAccum.includes('[[SEND:MENU_DAY]]')) {
+          sentDay = true; textAccum = textAccum.replace('[[SEND:MENU_DAY]]','');
           if (callSid) { const to = await getFromNumber(callSid); await sendSMS(to, `Sip & Sizzle Day Menu: ${DAY_MENU_LINK}`); }
         }
-        if (!sentDinner && DINNER_MENU_LINK && textBuffer.includes('[[SEND:MENU_DINNER]]')) {
-          sentDinner = true; textBuffer = textBuffer.replace('[[SEND:MENU_DINNER]]','');
+        if (!sentDinner && DINNER_MENU_LINK && textAccum.includes('[[SEND:MENU_DINNER]]')) {
+          sentDinner = true; textAccum = textAccum.replace('[[SEND:MENU_DINNER]]','');
           if (callSid) { const to = await getFromNumber(callSid); await sendSMS(to, `Sip & Sizzle Dinner Menu: ${DINNER_MENU_LINK}`); }
         }
-        if (!sentBev && BEVERAGE_MENU_LINK && textBuffer.includes('[[SEND:MENU_BEVERAGE]]')) {
-          sentBev = true; textBuffer = textBuffer.replace('[[SEND:MENU_BEVERAGE]]','');
+        if (!sentBev && BEVERAGE_MENU_LINK && textAccum.includes('[[SEND:MENU_BEVERAGE]]')) {
+          sentBev = true; textAccum = textAccum.replace('[[SEND:MENU_BEVERAGE]]','');
           if (callSid) { const to = await getFromNumber(callSid); await sendSMS(to, `Sip & Sizzle Beverage Menu: ${BEVERAGE_MENU_LINK}`); }
         }
 
         // Existing tokens for reservations/toast
-        if (textBuffer.includes('[[SEND:OPENTABLE]]')) {
-          textBuffer = textBuffer.replace('[[SEND:OPENTABLE]]','');
+        if (textAccum.includes('[[SEND:OPENTABLE]]')) {
+          textAccum = textAccum.replace('[[SEND:OPENTABLE]]','');
           if (callSid) { const to = await getFromNumber(callSid); await sendSMS(to, `Reservations: ${OPEN_TABLE_LINK}`); }
         }
-        if (textBuffer.includes('[[SEND:TOAST]]')) {
-          textBuffer = textBuffer.replace('[[SEND:TOAST]]','');
+        if (textAccum.includes('[[SEND:TOAST]]')) {
+          textAccum = textAccum.replace('[[SEND:TOAST]]','');
           if (callSid) { const to = await getFromNumber(callSid); await sendSMS(to, `Pickup ordering: ${TOAST_ORDER_LINK}`); }
         }
       }
@@ -398,24 +392,29 @@ After emitting a token, continue with a concise spoken answer. Always note that 
   twilioWS.on('message', (raw) => {
     try {
       const m = JSON.parse(raw.toString());
-      console.log('TWILIO EVENT:', m.event);
+      // console.log('TWILIO EVENT:', m.event); // noisy
       if (m.event === 'start') {
         console.log('Twilio start received');
         streamSid = m.start.streamSid;
         callSid = m.start.callSid;
         twilioReady = true;
+        samplesSinceCommit = 0;
         sendBeep(); // prove outbound audio path
         maybeStartGreeting();
       } else if (m.event === 'media' && m.media?.payload) {
-        // Caller audio -> OpenAI (buffer if OA WS not open yet)
+        // Caller audio -> OpenAI: append each chunk, commit only when >=100ms since last commit
         const pcm16 = mulawB64ToPCM16(m.media.payload);
+        const samples = pcm16.length / 2;
         const b64pcm = Buffer.from(pcm16).toString('base64');
+
         if (oaWS.readyState === WebSocket.OPEN) {
           oaWS.send(JSON.stringify({ type: 'input_audio_buffer.append', audio: b64pcm }));
-          oaWS.send(JSON.stringify({ type: 'input_audio_buffer.commit' }));
-          oaWS.send(JSON.stringify({ type: 'response.create', response: { modalities: ['audio'] } }));
-        } else {
-          pendingToOpenAI.push(b64pcm);
+          samplesSinceCommit += samples;
+          if (samplesSinceCommit >= 800) { // >=100ms at 8kHz
+            oaWS.send(JSON.stringify({ type: 'input_audio_buffer.commit' }));
+            oaWS.send(JSON.stringify({ type: 'response.create', response: { modalities: ['audio','text'] } }));
+            samplesSinceCommit = 0;
+          }
         }
       } else if (m.event === 'stop') {
         console.log('Twilio stop received');
