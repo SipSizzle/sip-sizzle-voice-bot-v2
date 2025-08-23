@@ -39,5 +39,3 @@ services:
         value: "gpt-4o-realtime-preview"
       - key: OPENAI_REALTIME_VOICE
         value: "verse"
-      - key: PORT
-        value: "3000"

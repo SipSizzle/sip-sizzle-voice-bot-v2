@@ -4,13 +4,13 @@ import bodyParser from 'body-parser';
 import OpenAI from 'openai';
 import twilio from 'twilio';
 import WebSocket, { WebSocketServer } from 'ws';
-import * as pdfjsLib from 'pdfjs-dist';
-import pdfjsWorker from 'pdfjs-dist/build/pdf.worker.mjs';
+import { getDocument, GlobalWorkerOptions } from 'pdfjs-dist';
 import path from 'path';
 import fs from 'fs';
 import { fileURLToPath } from 'url';
 
-pdfjsLib.GlobalWorkerOptions.workerSrc = pdfjsWorker;
+// Node runtime doesn't need a separate worker file
+GlobalWorkerOptions.workerSrc = undefined;
 
 const app = express();
 app.use(bodyParser.urlencoded({ extended: false }));
@@ -54,20 +54,20 @@ app.get('/', (req, res) => res.send('OK'));
 
 // --- SMS endpoint (optional: sends quick links on inbound SMS) ---
 app.post('/sms', async (req, res) => {
-  const { From, Body } = req.body || {};
-  const msgParts = [
+  const { From } = req.body || {};
+  const parts = [
     `Thanks for contacting ${RESTAURANT_NAME}!`,
     `Reservations: ${OPEN_TABLE_LINK}`,
     `Pickup: ${TOAST_ORDER_LINK}`
   ];
-  if (DAY_MENU_LINK) msgParts.push(`Day Menu: ${DAY_MENU_LINK}`);
-  if (DINNER_MENU_LINK) msgParts.push(`Dinner Menu: ${DINNER_MENU_LINK}`);
-  if (BEVERAGE_MENU_LINK) msgParts.push(`Beverage Menu: ${BEVERAGE_MENU_LINK}`);
-  try { await sendSMS(From, msgParts.join('  |  ')); } catch (e) { console.error('SMS auto-reply failed', e.message); }
+  if (DAY_MENU_LINK) parts.push(`Day Menu: ${DAY_MENU_LINK}`);
+  if (DINNER_MENU_LINK) parts.push(`Dinner Menu: ${DINNER_MENU_LINK}`);
+  if (BEVERAGE_MENU_LINK) parts.push(`Beverage Menu: ${BEVERAGE_MENU_LINK}`);
+  try { await sendSMS(From, parts.join('  |  ')); } catch (e) { console.error('SMS auto-reply failed', e.message); }
   res.status(204).end();
 });
 
-// --- Menu ingest from PDFs (using pdfjs-dist) ---
+// --- Menu ingest from PDFs (using pdfjs-dist in Node) ---
 const MENU_SOURCES = [
   { key: 'Day', url: DAY_MENU_LINK },
   { key: 'Dinner', url: DINNER_MENU_LINK },
@@ -79,7 +79,7 @@ async function fetchPdfText(url) {
   try {
     const resp = await fetch(url);
     const buf = Buffer.from(await resp.arrayBuffer());
-    const loadingTask = pdfjsLib.getDocument({ data: buf });
+    const loadingTask = getDocument({ data: buf });
     const pdf = await loadingTask.promise;
     let txt = '';
     for (let i = 1; i <= pdf.numPages; i++) {
@@ -142,12 +142,9 @@ await ingestMenus();
 // --- Voice: streaming via <Connect><Stream> ---
 app.post('/voice', (req, res) => {
   const twiml = new VoiceResponse();
-  // Optional: play recorded greeting here
-  // twiml.play(`https://${req.headers.host}/public/greeting.mp3`);
-
+  // Optional: twiml.play(`https://${req.headers.host}/public/greeting.mp3`);
   const connect = twiml.connect();
   connect.stream({ url: `wss://${req.headers.host}/twilio-stream`, track: 'both' });
-
   res.type('text/xml').send(twiml.toString());
 });
 
