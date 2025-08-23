@@ -23,7 +23,7 @@ const {
   TWILIO_ACCOUNT_SID,
   TWILIO_AUTH_TOKEN,
   TWILIO_NUMBER,
-  MESSAGING_SERVICE_SID, // optional (toll‑free/A2P recommended)
+  MESSAGING_SERVICE_SID, // optional
   RESTAURANT_NAME = 'Sip & Sizzle',
   RESTAURANT_CITY = 'Fort Myers, FL',
   RESTAURANT_ADDRESS = '2236 First Street, Fort Myers FL 33901',
@@ -34,7 +34,7 @@ const {
   BEVERAGE_MENU_LINK = '',
   OPENAI_REALTIME_MODEL = 'gpt-4o-realtime-preview',
   OPENAI_REALTIME_VOICE = 'verse',
-  PUBLIC_HOST // e.g. sip-sizzle-voice-bot.onrender.com
+  PUBLIC_HOST
 } = process.env;
 
 const LISTEN_PORT = process.env.PORT || 3000;
@@ -53,7 +53,7 @@ app.all('/voice-test', (req, res) => {
   res.type('text/xml').send(twiml.toString());
 });
 
-// --- Minimal TwiML streaming route with statusCallback (prevents 11750) ---
+// --- Minimal TwiML streaming route with statusCallback ---
 app.all('/voice', (req, res) => {
   const host = PUBLIC_HOST || req.get('X-Forwarded-Host') || req.get('Host');
   const httpBase = `https://${host}`;
@@ -62,13 +62,13 @@ app.all('/voice', (req, res) => {
   res.status(200).type('text/xml').send(xml);
 });
 
-// --- Status callback to see Twilio stream lifecycle ---
+// --- Status callback to monitor Twilio stream lifecycle ---
 app.post('/stream-status', (req, res) => {
   console.log('STREAM STATUS:', JSON.stringify(req.body));
   res.status(200).type('text/xml').send('<?xml version="1.0" encoding="UTF-8"?><Response/>');
 });
 
-// --- SMS quick links (optional) ---
+// --- SMS quick links ---
 app.post('/sms', async (req, res) => {
   const { From } = req.body || {};
   const parts = [
@@ -83,7 +83,7 @@ app.post('/sms', async (req, res) => {
   res.status(204).end();
 });
 
-// --- Menu ingest from PDFs (uses pdfjs legacy build) ---
+// --- Menu ingest from PDFs (pdfjs requires Uint8Array data) ---
 const MENU_SOURCES = [
   { key: 'Day', url: DAY_MENU_LINK },
   { key: 'Dinner', url: DINNER_MENU_LINK },
@@ -94,9 +94,10 @@ let MENU_LINES = []; // unified list of {source, text}
 
 async function fetchPdfText(url) {
   try {
-    const resp = await fetch(url);
-    const buf = Buffer.from(await resp.arrayBuffer());
-    const loadingTask = getDocument({ data: buf, useWorkerFetch: false, isEvalSupported: false });
+    const resp = await fetch(url, { headers: { 'User-Agent': 'Mozilla/5.0' } });
+    const ab = await resp.arrayBuffer();
+    const data = new Uint8Array(ab); // <-- FIX: pdfjs requires Uint8Array
+    const loadingTask = getDocument({ data, useWorkerFetch: false, isEvalSupported: false, disableFontFace: true });
     const pdf = await loadingTask.promise;
     let txt = '';
     for (let i = 1; i <= pdf.numPages; i++) {
@@ -115,13 +116,17 @@ function normalizeLines(txt) {
   return txt.split(/\r?\n/).map(l => l.replace(/\s+/g, ' ').trim()).filter(Boolean);
 }
 async function ingestMenus() {
-  MENU_LINES = [];
-  for (const src of MENU_SOURCES) {
-    const t = await fetchPdfText(src.url);
-    const lines = normalizeLines(t);
-    MENU_LINES.push(...lines.map(l => ({ source: src.key, text: l })));
+  try {
+    MENU_LINES = [];
+    for (const src of MENU_SOURCES) {
+      const t = await fetchPdfText(src.url);
+      const lines = normalizeLines(t);
+      MENU_LINES.push(...lines.map(l => ({ source: src.key, text: l })));
+    }
+    console.log(`Ingested ${MENU_LINES.length} menu lines from ${MENU_SOURCES.length} PDFs`);
+  } catch (e) {
+    console.error('Menu ingest failure', e);
   }
-  console.log(`Ingested ${MENU_LINES.length} menu lines from ${MENU_SOURCES.length} PDFs`);
 }
 function searchMenuLines(query, limit=8) {
   if (!MENU_LINES.length) return [];
@@ -152,7 +157,7 @@ function formatMenuAnswer(q, rows) {
   return `Here’s what I found:\n${bullets.join('\n')}\n(Items and prices can change; I can confirm with the team.)`;
 }
 
-// Load menus at boot (non-blocking for Twilio response speed)
+// Kick off ingest without blocking Twilio response
 ingestMenus().catch(e => console.error('Menu ingest failed at boot:', e));
 
 // --- μ-law helpers (Twilio uses 8kHz) ---
@@ -369,7 +374,7 @@ After emitting a token, continue with a concise spoken answer. Always note that 
   twilioWS.on('error', (err) => console.error('Twilio WS error', err));
 });
 
-// --- Global error guard (keeps TwiML tiny if anything throws) ---
+// --- Global error guard ---
 app.use((err, req, res, next) => {
   console.error('Unhandled error:', err);
   if (req.path === '/voice' || req.path === '/voice-test') {
