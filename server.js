@@ -40,7 +40,6 @@ const {
 
   OPENAI_REALTIME_MODEL = 'gpt-4o-realtime-preview',
   OPENAI_REALTIME_VOICE = 'verse',
-  // NOTE: Do NOT define PORT here to avoid duplicate declarations
 } = process.env;
 
 // Single listen port definition
@@ -231,11 +230,33 @@ wss.on('connection', async (twilioWS, req) => {
   let textBuffer = "";
   let sentDay = false, sentDinner = false, sentBev = false;
 
+  // Buffer Twilio audio frames until OpenAI WS is OPEN
+  const pendingToOpenAI = [];
+  const sendToOpenAI = (b64pcm16) => {
+    if (oaWS.readyState === WebSocket.OPEN) {
+      oaWS.send(JSON.stringify({ type: 'input_audio_buffer.append', audio: b64pcm16 }));
+      oaWS.send(JSON.stringify({ type: 'input_audio_buffer.commit' }));
+      oaWS.send(JSON.stringify({ type: 'response.create' }));
+    } else {
+      pendingToOpenAI.push(b64pcm16);
+    }
+  };
+
   const oaHeaders = { 'Authorization': `Bearer ${OPENAI_API_KEY}`, 'OpenAI-Beta': 'realtime=v1' };
   const oaUrl = `wss://api.openai.com/v1/realtime?model=${encodeURIComponent(OPENAI_REALTIME_MODEL)}`;
   const oaWS = new WebSocket(oaUrl, { headers: oaHeaders });
 
   oaWS.on('open', () => {
+    // Flush any pending audio captured before OpenAI WS opened
+    while (pendingToOpenAI.length) {
+      const b64 = pendingToOpenAI.shift();
+      oaWS.send(JSON.stringify({ type: 'input_audio_buffer.append', audio: b64 }));
+    }
+    if (pendingToOpenAI.length === 0) {
+      oaWS.send(JSON.stringify({ type: 'input_audio_buffer.commit' }));
+      oaWS.send(JSON.stringify({ type: 'response.create' }));
+    }
+
     const greeting = `Thank you for calling ${RESTAURANT_NAME}, located at ${RESTAURANT_ADDRESS} in ${RESTAURANT_CITY}. We are open every day at 10 a.m. for breakfast and lunch, and from 4 p.m. to 10 p.m. for dinner. Happy Hour is 3 to 5 p.m. with five-dollar appetizers and ten-dollar craft cocktails. You can ask me about menu items, prices, wine pairings, reservations, to-go orders, hours, or parking.`;
 
     const instructions =
@@ -305,10 +326,12 @@ After emitting a token, continue with a concise spoken answer. Always note that 
         }
       }
 
-      // Stream audio chunks from OpenAI -> Twilio
+      // Stream audio chunks from OpenAI -> Twilio (guard until WS OPEN)
       if (msg.type === 'output_audio.delta' && msg.audio && streamSid) {
-        const b64Mu = pcm16ToMulawB64(Buffer.from(msg.audio, 'base64'));
-        twilioWS.send(JSON.stringify({ event: 'media', streamSid, media: { payload: b64Mu } }));
+        if (twilioWS.readyState === WebSocket.OPEN) {
+          const b64Mu = pcm16ToMulawB64(Buffer.from(msg.audio, 'base64'));
+          twilioWS.send(JSON.stringify({ event: 'media', streamSid, media: { payload: b64Mu } }));
+        }
       }
 
     } catch (e) { console.error('OpenAI msg parse error', e); }
@@ -324,12 +347,13 @@ After emitting a token, continue with a concise spoken answer. Always note that 
       streamSid = m.start.streamSid;
       callSid = m.start.callSid;
       // Prime the model
-      oaWS.send(JSON.stringify({ type: 'response.create', response: { instructions: '' } }));
+      if (oaWS.readyState === WebSocket.OPEN) {
+        oaWS.send(JSON.stringify({ type: 'response.create', response: { instructions: '' } }));
+      }
     } else if (m.event === 'media' && m.media?.payload) {
       const pcm16 = mulawB64ToPCM16(m.media.payload);
-      oaWS.send(JSON.stringify({ type: 'input_audio_buffer.append', audio: pcm16.toString('base64') }));
-      oaWS.send(JSON.stringify({ type: 'input_audio_buffer.commit' }));
-      oaWS.send(JSON.stringify({ type: 'response.create' }));
+      const b64pcm = Buffer.from(pcm16).toString('base64');
+      sendToOpenAI(b64pcm);
     } else if (m.event === 'stop') {
       try { oaWS.close(); } catch {}
       try { twilioWS.close(); } catch {}
