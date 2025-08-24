@@ -31,9 +31,9 @@ const {
   DINNER_MENU_LINK = '',
   BEVERAGE_MENU_LINK = '',
   OPENAI_REALTIME_MODEL = 'gpt-4o-realtime-preview',
-  OPENAI_REALTIME_VOICE = 'verse',
+  OPENAI_REALTIME_VOICE = 'alloy',
   PUBLIC_HOST,
-  DISABLE_MENU_INGEST = 'false',
+  DISABLE_MENU_INGEST = 'true',
 } = process.env;
 
 const LISTEN_PORT = process.env.PORT || 3000;
@@ -55,24 +55,17 @@ app.all('/voice-test', (req, res) => {
 
 function safeForSpeech(s) { return String(s || '').replace(/&/g, 'and'); }
 
-// --- Twilio streaming TwiML ---
+// --- Twilio streaming TwiML (no statusCallback to avoid 64KB warnings) ---
 app.all('/voice', (req, res) => {
   const host = PUBLIC_HOST || req.get('X-Forwarded-Host') || req.get('Host');
-  const httpBase = `https://${host}`;
   const wssUrl = `wss://${host}/twilio-stream`;
 
   const twiml = new VoiceResponse();
   twiml.say({ voice: 'alice' }, `Thank you for calling ${safeForSpeech(RESTAURANT_NAME)}. One moment while I connect you.`);
   const connect = twiml.connect();
-  connect.stream({ url: wssUrl, statusCallback: `${httpBase}/stream-status`, statusCallbackMethod: 'POST' });
+  connect.stream({ url: wssUrl }); // removed statusCallback
 
   res.status(200).type('text/xml').send(twiml.toString());
-});
-
-app.post('/stream-status', (req, res) => {
-  try { console.log('STREAM STATUS:', JSON.stringify(req.body)); }
-  catch { console.log('STREAM STATUS (raw):', req.body); }
-  res.status(200).type('text/xml').send('<?xml version="1.0" encoding="UTF-8"?><Response/>');
 });
 
 // --- SMS quick links ---
@@ -90,7 +83,7 @@ app.post('/sms', async (req, res) => {
   res.status(204).end();
 });
 
-// --- Menu ingest from PDFs (Uint8Array for pdfjs) ---
+// --- Menu ingest from PDFs (disabled by default via env) ---
 const MENU_SOURCES = [
   { key: 'Day', url: DAY_MENU_LINK },
   { key: 'Dinner', url: DINNER_MENU_LINK },
@@ -179,7 +172,7 @@ function linearToUlaw(sample) {
   const mantissa = (sample >> (exponent + 3)) & 0x0f;
   return (~(sign | (exponent << 4) | mantissa)) & 0xff;
 }
-// naive decimation 24k -> 8k (pick every 3rd sample). Good enough for voice.
+// simple decimation 24k -> 8k (take every 3rd sample)
 function pcm24kToUlaw8k(pcm16LEBuf) {
   const inSamples = pcm16LEBuf.length / 2;
   const outSamples = Math.floor(inSamples / 3);
@@ -223,7 +216,8 @@ wss.on('connection', async (twilioWS, req) => {
   let sentDay = false, sentDinner = false, sentBev = false;
 
   let bytesSinceCommit = 0;
-  const COMMIT_BYTES = 1600; // 200ms at 8k
+  const COMMIT_BYTES = 3200; // >=400ms @ 8k to avoid 100ms errors robustly
+  let lastCommitAt = 0;
 
   const pendingToTwilio = [];
   let twilioReady = false;
@@ -238,7 +232,7 @@ wss.on('connection', async (twilioWS, req) => {
   const greeting = `Thank you for calling ${safeForSpeech(RESTAURANT_NAME)}. We’re in ${RESTAURANT_ADDRESS}, ${RESTAURANT_CITY}. We open daily at 10 a.m. for breakfast and lunch, and 4 to 10 p.m. for dinner. Happy Hour is 3 to 5 p.m. Ask me about menu items, prices, wine pairings, reservations, to-go orders, or parking.`;
 
   const instructions =
-`You are the friendly host for ${safeForSpeech(RESTAURANT_NAME)}. Speak casually and briefly. Never invent prices or availability.
+`You are the friendly host for ${safeForSpeech(RESTAURANT_NAME)}. Speak casually and briefly in **American English only**. Do not switch languages even if you detect another language. Keep answers concise and welcoming. Never invent prices or availability.
 
 To look up menu items or prices, emit one token line:
 [[MENU_SEARCH: <query>]]
@@ -270,7 +264,6 @@ After emitting a token, continue with a concise spoken answer. Always note that 
       session: {
         modalities: ['audio','text'],
         voice: OPENAI_REALTIME_VOICE,
-        // Keep Twilio input as mulaw 8k, output as PCM16 24k (we will resample to mulaw 8k)
         input_audio_format: { type: 'mulaw', sample_rate_hz: 8000 },
         output_audio_format: { type: 'pcm16', sample_rate_hz: 24000 },
         turn_detection: { type: 'server_vad', threshold: 0.5, prefix_padding_ms: 150, silence_duration_ms: 500 },
@@ -331,7 +324,7 @@ After emitting a token, continue with a concise spoken answer. Always note that 
 
       // OA audio (PCM16 24k) -> μ-law 8k for Twilio
       if (msg.type === 'response.audio.delta' && msg.delta) {
-        const pcm = Buffer.from(msg.delta, 'base64'); // little-endian 16-bit PCM @ 24k
+        const pcm = Buffer.from(msg.delta, 'base64'); // LE 16-bit PCM @ 24k
         const mu = pcm24kToUlaw8k(pcm);
         const b64mu = mu.toString('base64');
         pendingToTwilio.push(b64mu);
@@ -351,10 +344,9 @@ After emitting a token, continue with a concise spoken answer. Always note that 
 
   function sendBeep() {
     if (!streamSid || twilioWS.readyState !== WebSocket.OPEN) return;
-    // tiny clickless 200ms 440Hz beep in μ-law 8k
-    const sampleRate = 8000, ms = 200, freq = 440;
+    const sampleRate = 8000, ms = 180, freq = 440;
     const samples = Math.floor(sampleRate * (ms / 1000));
-    const amp = 7000;
+    const amp = 6000;
     const mu = Buffer.alloc(samples);
     for (let i = 0; i < samples; i++) {
       const t = i / sampleRate;
@@ -364,6 +356,15 @@ After emitting a token, continue with a concise spoken answer. Always note that 
     const b64Mu = mu.toString('base64');
     twilioWS.send(JSON.stringify({ event: 'media', streamSid, media: { payload: b64Mu } }));
   }
+
+  // Periodic commit timer (every 250ms) to commit if enough bytes are buffered
+  const commitTimer = setInterval(() => {
+    if (bytesSinceCommit >= COMMIT_BYTES && twilioReady && oaWS.readyState === WebSocket.OPEN) {
+      oaWS.send(JSON.stringify({ type: 'input_audio_buffer.commit' }));
+      bytesSinceCommit = 0;
+      lastCommitAt = Date.now();
+    }
+  }, 250);
 
   // --- Twilio WS ---
   twilioWS.on('message', (raw) => {
@@ -375,18 +376,15 @@ After emitting a token, continue with a concise spoken answer. Always note that 
         callSid = m.start.callSid;
         twilioReady = true;
         bytesSinceCommit = 0;
+        lastCommitAt = Date.now();
         sendBeep();
         maybeStartGreeting();
       } else if (m.event === 'media' && m.media?.payload) {
-        const b64mu = m.media.payload; // base64 μ-law 8k
+        const b64mu = m.media.payload;
         if (oaWS.readyState === WebSocket.OPEN) {
           oaWS.send(JSON.stringify({ type: 'input_audio_buffer.append', audio: b64mu }));
-          bytesSinceCommit += Buffer.from(b64mu, 'base64').length;
-          if (bytesSinceCommit >= COMMIT_BYTES) {
-            oaWS.send(JSON.stringify({ type: 'input_audio_buffer.commit' }));
-            // rely on server_vad to trigger responses
-            bytesSinceCommit = 0;
-          }
+          const inc = Buffer.from(b64mu, 'base64').length;
+          if (inc > 0) bytesSinceCommit += inc;
         }
       } else if (m.event === 'stop') {
         console.log('Twilio stop received');
@@ -399,7 +397,11 @@ After emitting a token, continue with a concise spoken answer. Always note that 
   });
 
   twilioWS.on('ping', () => { try { twilioWS.pong(); } catch {} });
-  twilioWS.on('close', (code, reason) => { console.log('Twilio WS closed', code, reason?.toString()); try { oaWS.close(); } catch {} });
+  twilioWS.on('close', (code, reason) => {
+    console.log('Twilio WS closed', code, reason?.toString());
+    try { clearInterval(commitTimer); } catch {}
+    try { oaWS.close(); } catch {}
+  });
   twilioWS.on('error', (err) => console.error('Twilio WS error', err));
 });
 
